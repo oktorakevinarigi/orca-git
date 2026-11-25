@@ -1,0 +1,1387 @@
+import type { ActionRequest, ActionResult, BranchRef, CommitRow, FileChange, LogFilter, RefsResult, RepoInfo, RepoResult, RewriteKind, WorkspaceChoice } from '../shared/protocol.ts'
+import { api, copyText, errorMessage, orca } from './api.ts'
+import { renderBranches } from './branches.ts'
+import { addColumnResizers, validColumnWidths, type ColumnWidths } from './columns.ts'
+import { renderDetails, renderMany, renderPlaceholder } from './details.ts'
+import { openDiff, type DiffMode } from './diff.ts'
+import { askDirtyCheckout, askName, askPatch, askPush, askRebasePlan, askReset, busy, confirm, editMessage, pushedWarning } from './dialogs.ts'
+import { append, h, icon } from './dom.ts'
+import { createFilterBar } from './filters.ts'
+import { reachableFrom, refLabels, relativeDate, fullDate, shortHash } from './format.ts'
+import { computeGraph, graphLanes, graphSvg, ROW_HEIGHT, type GraphRow } from './graph.ts'
+import { showMenu, type MenuEntry } from './menu.ts'
+
+const MODE = document.body.dataset.mode === 'editor' ? 'editor' : 'panel'
+const PREFS_KEY = `git-log.prefs.${MODE}`
+
+interface Prefs {
+  branches: boolean
+  details: boolean
+  regex: boolean
+  matchCase: boolean
+  branchesWidth: number
+  detailsWidth: number
+  detailsHeight: number
+  collapsed: string[]
+  /** Workspace picked by the user, keyed by the ids of the same-named workspaces it was picked among. */
+  picked: Record<string, string>
+  diffMode?: DiffMode
+  /** The diff shows only the changed regions; by default it shows the whole file. */
+  diffChangesOnly?: boolean
+  /** Widths of the log's Author, Date and Hash columns, once resized. */
+  columns?: ColumnWidths
+}
+
+const prefs: Prefs = {
+  branches: MODE === 'editor',
+  details: true,
+  regex: false,
+  matchCase: false,
+  branchesWidth: 220,
+  detailsWidth: 340,
+  detailsHeight: 220,
+  collapsed: ['tags'],
+  picked: {},
+  ...(() => {
+    try {
+      return JSON.parse(localStorage.getItem(PREFS_KEY) ?? '{}')
+    } catch {
+      return {}
+    }
+  })()
+}
+const savePrefs = () => localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+
+// ---------- State ----------
+
+let repo: RepoInfo | null = null
+let refs: RefsResult | null = null
+let rows: CommitRow[] = []
+let graph: GraphRow[] = []
+let graphColumnLanes = 1
+/** Stands for the work tree in the graph; never a real commit hash. */
+const UNCOMMITTED = '*uncommitted*'
+/** Files with uncommitted changes in the work tree. */
+let uncommitted = 0
+/** The "Uncommitted Changes" row above the commits, when it is shown. */
+let uncommittedGraph: GraphRow | null = null
+let reachable = new Set<string>()
+/** First-parent chain from HEAD within the loaded rows, newest first. */
+let mainline: CommitRow[] = []
+let indexByHash = new Map<string, number>()
+let hasMore = false
+let loading = false
+let loadToken = 0
+let loadError: string | null = null
+let choices: WorkspaceChoice[] = []
+/** Workspace named by the editor tab's document, whose repo has no focused workspace id. */
+let docWorkspaceId: string | null = null
+let filter: LogFilter = {}
+/** Select HEAD's commit once the log of a newly opened repository loads. */
+let selectHead = false
+const selected = new Set<string>()
+let anchor = -1
+let cursor = -1
+const collapsed = new Set(prefs.collapsed)
+
+const isFiltered = () =>
+  Boolean(filter.text?.trim() || filter.users?.length || filter.since || filter.until || filter.paths?.length)
+
+// ---------- Layout ----------
+
+const app = document.getElementById('app')!
+
+const searchInput = h('input', { placeholder: 'Text or hash', spellcheck: false, 'aria-label': 'Filter by text or hash' }) as HTMLInputElement
+const regexToggle = h('button', { class: `toggle${prefs.regex ? ' on' : ''}`, title: 'Regex' }, '.*')
+const caseToggle = h('button', { class: `toggle${prefs.matchCase ? ' on' : ''}`, title: 'Match case' }, 'Cc')
+const treeToggle = h('button', { class: 'tool', title: 'Show branches' }, icon('tree'))
+const detailsToggle = h('button', { class: 'tool', title: 'Show details' }, icon('details'))
+const refreshButton = h('button', { class: 'tool', title: 'Refresh' }, icon('refresh'))
+const fetchButton = h('button', { class: 'tool', title: 'Fetch all remotes' }, icon('fetch'))
+const pushButton = h('button', { class: 'tool', title: 'Push…' }, icon('push'))
+const statusChip = h('button', { class: 'status-chip', hidden: true })
+const tabButton = h('button', { class: 'tool', title: 'Open Git Log in an editor tab' }, icon('external'))
+
+const filterBar = createFilterBar({
+  get filter() {
+    return filter
+  },
+  get refs() {
+    return refs
+  },
+  apply: (change) => applyFilter(change)
+})
+
+const toolbar = h(
+  'div',
+  { class: 'toolbar' },
+  treeToggle,
+  h('label', { class: 'search' }, icon('search'), searchInput, regexToggle, caseToggle),
+  ...filterBar.elements,
+  h('div', { class: 'spacer' }),
+  statusChip,
+  fetchButton,
+  pushButton,
+  refreshButton,
+  detailsToggle,
+  MODE === 'panel' ? tabButton : null
+)
+
+const bannerText = h('div', { class: 'text' })
+const bannerActions = h('div', { style: 'display:flex;gap:12px' })
+const banner = h(
+  'div',
+  { class: 'banner', role: 'status' },
+  bannerText,
+  bannerActions,
+  h('button', { class: 'tool', title: 'Dismiss', onclick: () => hideBanner() }, icon('close'))
+)
+
+const treeSearch = h('input', { class: 'field tree-search', placeholder: 'Search branches', spellcheck: false }) as HTMLInputElement
+const tree = h('div', { class: 'tree', role: 'tree' })
+const treeShowing = h('div', { class: 'tree-showing' })
+const branchesPane = h('aside', { class: 'pane branches' }, treeSearch, treeShowing, tree)
+const branchesSplit = h('div', { class: 'splitter' })
+
+const header = h(
+  'div',
+  { class: 'header columns' },
+  h('div', { class: 'subject' }, 'Subject'),
+  h('div', { class: 'author' }, 'Author'),
+  h('div', { class: 'date' }, 'Date'),
+  h('div', { class: 'hash' }, 'Hash')
+)
+const sizer = h('div', { class: 'sizer' })
+const viewport = h('div', { class: 'viewport', tabindex: 0, role: 'grid', 'aria-multiselectable': 'true' }, sizer)
+const empty = h('div', { class: 'empty' })
+const logPane = h('section', { class: 'pane log' }, header, viewport, empty)
+const detailsSplit = h('div', { class: 'splitter details-split' })
+const detailsPane = h('aside', { class: 'pane details' })
+const center = h('div', { class: 'main center' }, logPane, detailsSplit, detailsPane)
+
+app.append(toolbar, banner, h('div', { class: 'main' }, branchesPane, branchesSplit, center))
+
+function applyLayout(): void {
+  branchesPane.style.display = branchesSplit.style.display = prefs.branches ? '' : 'none'
+  detailsPane.style.display = detailsSplit.style.display = prefs.details ? '' : 'none'
+  treeToggle.classList.toggle('on', prefs.branches)
+  detailsToggle.classList.toggle('on', prefs.details)
+  app.style.setProperty('--branches-w', `${prefs.branchesWidth}px`)
+  app.style.setProperty('--details-w', `${prefs.detailsWidth}px`)
+  app.style.setProperty('--details-h', `${prefs.detailsHeight}px`)
+  const columns = validColumnWidths(prefs.columns)
+  for (const key of ['author', 'date', 'hash'] as const) {
+    if (columns) app.style.setProperty(`--${key}-w`, `${columns[key]}px`)
+    else app.style.removeProperty(`--${key}-w`)
+  }
+}
+
+addColumnResizers(header, {
+  change: (widths) => {
+    prefs.columns = widths
+    applyLayout()
+  },
+  done: savePrefs,
+  reset: () => {
+    prefs.columns = undefined
+    applyLayout()
+    savePrefs()
+  }
+})
+
+new ResizeObserver(() => {
+  app.classList.toggle('narrow', app.clientWidth < 640)
+  renderRows()
+}).observe(app)
+
+function dragSplitter(splitter: HTMLElement, onMove: (dx: number, dy: number, start: Prefs) => void): void {
+  splitter.addEventListener('mousedown', (event) => {
+    event.preventDefault()
+    const start = { ...prefs }
+    const move = (e: MouseEvent) => {
+      onMove(e.clientX - event.clientX, e.clientY - event.clientY, start)
+      applyLayout()
+    }
+    const up = () => {
+      removeEventListener('mousemove', move)
+      removeEventListener('mouseup', up)
+      savePrefs()
+    }
+    addEventListener('mousemove', move)
+    addEventListener('mouseup', up)
+  })
+}
+
+const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v))
+dragSplitter(branchesSplit, (dx, _dy, start) => (prefs.branchesWidth = clamp(start.branchesWidth + dx, 120, 600)))
+dragSplitter(detailsSplit, (dx, dy, start) => {
+  if (app.classList.contains('narrow')) prefs.detailsHeight = clamp(start.detailsHeight - dy, 80, innerHeight - 120)
+  else prefs.detailsWidth = clamp(start.detailsWidth - dx, 200, 900)
+})
+
+// ---------- Banner ----------
+
+let bannerTimer: ReturnType<typeof setTimeout> | undefined
+
+function showBanner(text: string, kind: 'success' | 'error' | 'info', actions: { label: string; run: () => void }[] = [], sticky = false): void {
+  clearTimeout(bannerTimer)
+  banner.className = `banner show ${kind}`
+  bannerText.textContent = text
+  bannerActions.replaceChildren(
+    ...actions.map((a) =>
+      h(
+        'button',
+        {
+          class: 'link',
+          onclick: () => {
+            hideBanner()
+            a.run()
+          }
+        },
+        a.label
+      )
+    )
+  )
+  if (!sticky && kind !== 'error') bannerTimer = setTimeout(hideBanner, actions.length ? 15_000 : 6_000)
+}
+
+function hideBanner(): void {
+  clearTimeout(bannerTimer)
+  banner.className = 'banner'
+  if (repo?.operation) showOperationBanner()
+}
+
+function showOperationBanner(): void {
+  if (!repo?.operation) return
+  showBanner(
+    `A ${repo.operation} is in progress in this repository. History rewrites are disabled until it is finished or aborted.`,
+    'info',
+    [],
+    true
+  )
+}
+
+// ---------- Rows ----------
+
+function recompute(): void {
+  indexByHash = new Map(rows.map((row, i) => [row.hash, i]))
+  // Uncommitted changes sit above HEAD's commit, like a commit-to-be whose parent is HEAD.
+  const head = repo?.head.hash
+  const withUncommitted = uncommitted > 0 && !isFiltered() && !!head && indexByHash.has(head)
+  const all = computeGraph(withUncommitted ? [{ hash: UNCOMMITTED, parents: [head!], dashed: true }, ...rows] : rows, isFiltered())
+  uncommittedGraph = withUncommitted ? all[0] : null
+  graph = withUncommitted ? all.slice(1) : all
+  graphColumnLanes = graphLanes(all)
+  reachable = reachableFrom(repo?.head.hash ?? null, rows)
+  mainline = []
+  for (let i = indexByHash.get(repo?.head.hash ?? ''); i !== undefined; i = indexByHash.get(rows[i].parents[0] ?? '')) {
+    mainline.push(rows[i])
+  }
+}
+
+/** Why the selection can't be rewritten by a rebase from HEAD (mirrors the worker's checks), if it can't. */
+function rewriteBlocker(hashes: string[], fixupParent: boolean): string | undefined {
+  if (isFiltered()) return undefined
+  const position = new Map(mainline.map((row, i) => [row.hash, i]))
+  let oldest = -1
+  for (const hash of hashes) {
+    const i = position.get(hash)
+    if (i === undefined) {
+      return reachable.has(hash)
+        ? 'Commits of merged branches cannot be rewritten (not on the first-parent history of HEAD)'
+        : 'Only commits of the current branch can be rewritten'
+    }
+    oldest = Math.max(oldest, i)
+  }
+  if (fixupParent) oldest++
+  const merge = mainline.slice(0, oldest + 1).find((row) => row.parents.length > 1)
+  if (merge) return `History between HEAD and the selection contains the merge commit ${shortHash(merge.hash)}`
+  return undefined
+}
+
+function renderEmpty(): void {
+  let text = ''
+  let retry = false
+  if (!repo) text = loadError ?? 'Loading…'
+  else if (loadError) {
+    text = loadError
+    retry = true
+  } else if (!rows.length) text = loading ? 'Loading…' : isFiltered() || filter.branches?.length ? 'No commits match the filters.' : 'No commits yet.'
+  empty.style.display = text ? '' : 'none'
+  if (!repo && choices.length) {
+    empty.replaceChildren(
+      h('div', {}, text),
+      h(
+        'div',
+        { class: 'choices' },
+        ...choices.map((choice) =>
+          h(
+            'button',
+            { class: 'choice', title: choice.path, onclick: () => pick(choice) },
+            h('span', { class: 'choice-path' }, choice.path),
+            choice.branch ? h('span', { class: 'choice-branch' }, choice.branch) : ''
+          )
+        )
+      )
+    )
+    return
+  }
+  empty.replaceChildren(text, retry ? h('button', { class: 'btn', onclick: () => void refreshAll() }, 'Retry') : '')
+}
+
+const choiceKey = (list: WorkspaceChoice[]) => list.map((c) => c.id).sort().join('|')
+
+function pick(choice: WorkspaceChoice): void {
+  prefs.picked[choiceKey(choices)] = choice.id
+  savePrefs()
+  void start()
+}
+
+/** Rows start below the "Uncommitted Changes" row when it is shown. */
+const rowsOffset = () => (uncommittedGraph ? ROW_HEIGHT : 0)
+const rowTop = (index: number) => rowsOffset() + index * ROW_HEIGHT
+
+/** The work tree's changes, as Git Graph shows them: a dashed node above HEAD. Not selectable. */
+function uncommittedElement(row: GraphRow): HTMLElement {
+  const subject = h('div', { class: 'cell subject' })
+  subject.innerHTML = graphSvg(row, { lanes: graphColumnLanes })
+  subject.append(h('span', { class: 'text' }, `Uncommitted Changes (${uncommitted})`))
+  return h(
+    'div',
+    {
+      class: 'row columns uncommitted',
+      style: 'top:0px',
+      role: 'row',
+      title: `${uncommitted} ${uncommitted === 1 ? 'file has' : 'files have'} uncommitted changes`
+    },
+    subject,
+    h('div', { class: 'cell author' }, '*'),
+    h('div', { class: 'cell date' }),
+    h('div', { class: 'cell hash mono' }, '*')
+  )
+}
+
+function rowElement(index: number): HTMLElement {
+  const commit = rows[index]
+  const isHead = commit.hash === repo?.head.hash
+  const labels = refLabels(commit.refs, repo?.head.branch ?? null)
+  const subject = h('div', { class: 'cell subject' })
+  subject.innerHTML = graphSvg(graph[index], { lanes: graphColumnLanes })
+  if (labels.length) {
+    subject.append(
+      h(
+        'span',
+        { class: 'refs', style: `--lane: var(--c${graph[index].color})` },
+        ...labels.map((label) =>
+          h(
+            'span',
+            { class: `ref ${label.kind}${label.current ? ' current' : ''}`, title: label.refs.join(', ') },
+            icon(label.kind === 'tag' ? 'tag' : label.current ? 'star' : 'branch'),
+            h('span', { class: 'ref-name' }, label.name),
+            ...label.remotes.map((remote) => h('span', { class: 'ref-remote' }, remote))
+          )
+        )
+      )
+    )
+  }
+  subject.append(h('span', { class: 'text' }, commit.subject))
+  const committerDiffers = commit.committer !== commit.author
+  return h(
+    'div',
+    {
+      class: `row columns${selected.has(commit.hash) ? ' selected' : ''}${isHead ? ' head' : ''}`,
+      style: `top:${rowTop(index)}px`,
+      dataset: { index: String(index) },
+      role: 'row',
+      'aria-selected': String(selected.has(commit.hash))
+    },
+    subject,
+    h(
+      'div',
+      {
+        class: `cell author${refs?.me && commit.author === refs.me ? ' me' : ''}`,
+        title: `${commit.author} <${commit.email}>${committerDiffers ? `\nCommitted by ${commit.committer}` : ''}`
+      },
+      commit.author + (committerDiffers ? '*' : '')
+    ),
+    h('div', { class: 'cell date', title: fullDate(commit.authorTime) }, relativeDate(commit.authorTime)),
+    h('div', { class: 'cell hash mono', title: commit.hash }, shortHash(commit.hash))
+  )
+}
+
+let renderQueued = false
+function renderRows(): void {
+  if (renderQueued) return
+  renderQueued = true
+  requestAnimationFrame(() => {
+    renderQueued = false
+    const top = viewport.scrollTop
+    const height = viewport.clientHeight || 600
+    const offset = rowsOffset()
+    const first = Math.max(0, Math.floor((top - offset) / ROW_HEIGHT) - 10)
+    const last = Math.min(rows.length, Math.ceil((top - offset + height) / ROW_HEIGHT) + 10)
+    sizer.style.height = `${offset + (rows.length + (hasMore ? 1 : 0)) * ROW_HEIGHT}px`
+    const children: HTMLElement[] = []
+    if (uncommittedGraph && first === 0) children.push(uncommittedElement(uncommittedGraph))
+    for (let i = first; i < last; i++) children.push(rowElement(i))
+    if (hasMore && last >= rows.length) {
+      children.push(h('div', { class: 'loading-more', style: `top:${rowTop(rows.length)}px` }, h('div', { class: 'spin' })))
+    }
+    sizer.replaceChildren(...children)
+    renderEmpty()
+    if (hasMore && !loading && !loadError && last >= rows.length - 40) void loadMore()
+  })
+}
+
+viewport.addEventListener('scroll', renderRows, { passive: true })
+
+// ---------- Loading ----------
+
+async function reloadLog(keepCount = false): Promise<void> {
+  if (!repo) return
+  const token = ++loadToken
+  loading = true
+  loadError = null
+  if (!keepCount) {
+    rows = []
+    recompute()
+  }
+  renderRows()
+  const limit = keepCount && rows.length > 300 ? Math.min(rows.length, 2000) : undefined
+  try {
+    const page = await api.page(repo.root, filter, 0, limit)
+    if (token !== loadToken) return
+    rows = page.commits
+    hasMore = page.hasMore
+  } catch (error) {
+    if (token !== loadToken) return
+    rows = []
+    hasMore = false
+    loadError = errorMessage(error)
+  }
+  loading = false
+  recompute()
+  for (const hash of [...selected]) if (!indexByHash.has(hash)) selected.delete(hash)
+  if (selectHead) {
+    selectHead = false
+    const head = indexByHash.get(repo.head.hash ?? '')
+    if (head !== undefined && !selected.size) {
+      selected.add(rows[head].hash)
+      anchor = head
+    }
+  }
+  cursor = selected.size ? Math.min(...[...selected].map((h) => indexByHash.get(h)!)) : -1
+  if (anchor >= rows.length) anchor = cursor
+  renderRows()
+  updateDetails()
+}
+
+async function loadMore(): Promise<void> {
+  if (!repo || loading || !hasMore) return
+  const token = loadToken
+  loading = true
+  try {
+    const page = await api.page(repo.root, filter, rows.length)
+    if (token !== loadToken) return
+    const known = new Set(rows.map((r) => r.hash))
+    rows = rows.concat(page.commits.filter((c) => !known.has(c.hash)))
+    hasMore = page.hasMore && page.commits.length > 0
+  } catch (error) {
+    if (token !== loadToken) return
+    hasMore = false
+    showBanner(`Could not load more commits: ${errorMessage(error)}`, 'error')
+  } finally {
+    if (token === loadToken) loading = false
+  }
+  recompute()
+  renderRows()
+}
+
+async function loadRefs(): Promise<void> {
+  if (!repo) return
+  try {
+    refs = await api.refs(repo.root)
+    repo.head = refs.head
+    setUncommitted(refs.uncommitted)
+  } catch (error) {
+    refs = null
+    showBanner(`Could not read branches: ${errorMessage(error)}`, 'error')
+  }
+  renderTree()
+  renderStatus()
+  filterBar.update()
+}
+
+function setUncommitted(count: number): void {
+  const next = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
+  if (next === uncommitted) return
+  const wasShown = Boolean(uncommittedGraph)
+  uncommitted = next
+  recompute()
+  // Keep the commits where they were on screen when the row appears or goes.
+  const shift = (uncommittedGraph ? ROW_HEIGHT : 0) - (wasShown ? ROW_HEIGHT : 0)
+  if (shift && viewport.scrollTop > 0) viewport.scrollTop += shift
+  renderRows()
+}
+
+/** A file of the work tree changed: only the uncommitted changes count is read again. */
+async function refreshUncommitted(): Promise<void> {
+  if (!repo) return
+  const root = repo.root
+  try {
+    const { count } = await api.uncommitted(root)
+    if (root === repo?.root) setUncommitted(count)
+  } catch {
+    // The next full refresh (focus, a ref change) reads it again.
+  }
+}
+
+const count = (n: number) => (n > 99 ? '99+' : String(n))
+
+/** The toolbar chip: current branch, commits to pull ↙ / push ↗, and any operation in progress. */
+function renderStatus(): void {
+  const head = refs?.head ?? repo?.head
+  statusChip.hidden = !repo || !head?.hash
+  if (!repo || !head?.hash) return
+  const status = refs?.status
+  const operation = refs?.operation ?? repo.operation
+  statusChip.replaceChildren()
+  append(statusChip, [
+    icon('branch'),
+    h('span', { class: 'status-name' }, head.branch ?? `detached at ${shortHash(head.hash)}`),
+    status?.behind ? h('span', { class: 'behind' }, `↙${count(status.behind)}`) : null,
+    status?.ahead ? h('span', { class: 'ahead' }, `↗${count(status.ahead)}`) : null,
+    operation ? h('span', { class: 'operation' }, operation.toUpperCase()) : null
+  ])
+  statusChip.title = [
+    repo.root,
+    head.branch
+      ? status?.upstream
+        ? `${head.branch} tracks ${status.upstream}: ${status.ahead} to push, ${status.behind} to pull${status.behind ? ' (Fetch first to be sure)' : ''}`
+        : `${head.branch} tracks no remote branch: Push publishes it`
+      : 'HEAD is detached',
+    operation ? `A ${operation} is in progress` : '',
+    'Click to select the current commit'
+  ]
+    .filter(Boolean)
+    .join('\n')
+  pushButton.disabled = !head.branch
+  pushButton.title = head.branch ? `Push ${head.branch}…` : 'Check out a branch to push it'
+}
+
+let refreshing: Promise<void> | null = null
+async function refreshAll(): Promise<void> {
+  if (refreshing) return refreshing
+  refreshing = (async () => {
+    if (!repo) return start()
+    const result = await api.resolve(repo.root).catch((error) => ({ ok: false as const, reason: errorMessage(error) }))
+    if (!result.ok) {
+      loadError = result.reason
+      renderEmpty()
+      return
+    }
+    const wasOperation = repo.operation
+    repo = { ...result.repo, workspaceId: repo.workspaceId }
+    if (repo.operation) showOperationBanner()
+    else if (wasOperation) hideBanner()
+    await Promise.all([loadRefs(), reloadLog(true)])
+  })().finally(() => (refreshing = null))
+  return refreshing
+}
+
+let changeTimer: ReturnType<typeof setTimeout> | undefined
+const scheduleRefresh = (delay = 200) => {
+  clearTimeout(changeTimer)
+  changeTimer = setTimeout(() => void refreshAll(), delay)
+}
+
+function setRepo(next: RepoInfo): void {
+  const same = repo?.root === next.root
+  repo = next
+  loadError = null
+  if (!same) {
+    selected.clear()
+    anchor = cursor = -1
+    selectHead = true
+    uncommitted = 0
+    filter = { ...filter, branches: [] }
+    viewport.scrollTop = 0
+    document.title = `Git Log: ${next.name}`
+    void api.watch(next.root).catch(() => undefined)
+  }
+  if (next.operation) showOperationBanner()
+  void loadRefs()
+  void reloadLog(same)
+}
+
+async function start(): Promise<void> {
+  let root: string | undefined
+  if (MODE === 'editor') {
+    try {
+      const doc = await orca.document!.get()
+      const content = JSON.parse(doc.content.text ?? '{}')
+      root = content.root
+      docWorkspaceId = typeof content.workspaceId === 'string' ? content.workspaceId : null
+    } catch {
+      root = undefined
+    }
+  }
+  try {
+    let result: RepoResult = await api.resolve(root)
+    if (!result.ok && result.choices?.length) {
+      const saved = prefs.picked[choiceKey(result.choices)]
+      if (saved && result.choices.some((c) => c.id === saved)) result = await api.resolve(undefined, saved)
+    }
+    choices = !result.ok ? (result.choices ?? []) : []
+    if (result.ok) setRepo(result.repo)
+    else {
+      repo = null
+      rows = []
+      refs = null
+      loadError = result.reason
+      recompute()
+      renderTree()
+      renderStatus()
+      renderRows()
+      renderPlaceholder(detailsPane, '')
+    }
+  } catch (error) {
+    loadError = errorMessage(error)
+    renderEmpty()
+  }
+}
+
+// ---------- Filters ----------
+
+function applyFilter(change: Partial<LogFilter>): void {
+  filter = { ...filter, ...change }
+  for (const key of Object.keys(filter) as (keyof LogFilter)[]) {
+    const value = filter[key]
+    if (value === undefined || value === '' || (Array.isArray(value) && !value.length)) delete filter[key]
+  }
+  filterBar.update()
+  renderTree()
+  void reloadLog()
+}
+
+let searchTimer: ReturnType<typeof setTimeout> | undefined
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => applyFilter({ text: searchInput.value.trim() }), 300)
+})
+searchInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    clearTimeout(searchTimer)
+    applyFilter({ text: searchInput.value.trim() })
+  } else if (event.key === 'Escape' && searchInput.value) {
+    searchInput.value = ''
+    applyFilter({ text: '' })
+  } else if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    viewport.focus()
+    if (!selected.size && rows.length) selectOnly(0)
+  }
+})
+const toggleOption = (button: HTMLElement, key: 'regex' | 'matchCase') => {
+  prefs[key] = !prefs[key]
+  button.classList.toggle('on', prefs[key])
+  savePrefs()
+  applyFilter({ [key]: prefs[key] || undefined })
+}
+regexToggle.addEventListener('click', () => toggleOption(regexToggle, 'regex'))
+caseToggle.addEventListener('click', () => toggleOption(caseToggle, 'matchCase'))
+if (prefs.regex) filter.regex = true
+if (prefs.matchCase) filter.matchCase = true
+
+// ---------- Branches tree ----------
+
+function renderTree(): void {
+  const shown = filter.branches ?? []
+  treeShowing.replaceChildren(
+    ...(shown.length
+      ? [
+          icon('filter'),
+          h(
+            'span',
+            { class: 'label', title: shown.join('\n') },
+            'Showing ',
+            h('strong', null, shown.map((full) => full.replace(/^refs\/(heads|remotes|tags)\//, '')).join(', '))
+          ),
+          h('button', { class: 'link', onclick: () => applyFilter({ branches: [] }) }, 'Show all')
+        ]
+      : [h('span', { class: 'label' }, 'All branches'), h('span', { class: 'hint' }, 'Click a branch to show only it')])
+  )
+  treeShowing.classList.toggle('on', shown.length > 0)
+  renderBranches(
+    tree,
+    {
+      refs,
+      filtered: shown,
+      collapsed,
+      onCollapse: () => {
+        prefs.collapsed = [...collapsed]
+        savePrefs()
+        renderTree()
+      },
+      select: (hash) => void jumpTo(hash),
+      toggleFilter: (full, additive) => {
+        const next = additive
+          ? shown.includes(full)
+            ? shown.filter((b) => b !== full)
+            : [...shown, full]
+          : shown.length === 1 && shown[0] === full
+            ? []
+            : [full]
+        applyFilter({ branches: next })
+      },
+      menu: (event, ref) => branchMenu(event, ref)
+    },
+    treeSearch.value
+  )
+}
+treeSearch.addEventListener('input', renderTree)
+
+function branchMenu(event: MouseEvent, ref: BranchRef & { kind: 'local' | 'remote' | 'tag' | 'head' }): void {
+  const current = ref.kind === 'local' && ref.name === repo?.head.branch
+  const localName = ref.kind === 'remote' ? ref.name.slice(ref.name.indexOf('/') + 1) : ref.name
+  const branch = ref.kind === 'local' || ref.kind === 'remote'
+  const onBranch = repo?.head.branch ?? null
+  const operation = refs?.operation ?? repo?.operation ?? null
+  const intoHint = operation ? `A ${operation} is in progress` : !onBranch ? 'HEAD is detached' : `It is the current branch`
+  const intoOff = Boolean(operation) || !onBranch || current
+  const entries: MenuEntry[] = [
+    ref.kind === 'local'
+      ? { label: 'Checkout', icon: 'checkout', disabled: current, hint: 'Already checked out', run: () => void checkout(ref.name) }
+      : ref.kind === 'remote'
+        ? {
+            label: `Checkout as '${localName}'`,
+            icon: 'checkout',
+            disabled: Boolean(refs?.locals.some((l) => l.name === localName)),
+            hint: `A local branch ${localName} already exists`,
+            run: () => void checkout(localName)
+          }
+        : { label: 'Checkout Revision', icon: 'checkout', disabled: ref.kind === 'head', run: () => void checkout(ref.hash) },
+    { label: `New Branch from '${ref.name}'…`, icon: 'branch', run: () => void newBranch(ref.hash) }
+  ]
+  if (branch) {
+    entries.push(
+      'separator',
+      {
+        label: `Merge '${ref.name}' into '${onBranch ?? 'HEAD'}'`,
+        icon: 'merge',
+        disabled: intoOff,
+        hint: intoHint,
+        run: () => void mergeInto(ref.full, ref.name)
+      },
+      {
+        label: `Rebase '${onBranch ?? 'HEAD'}' onto '${ref.name}'`,
+        icon: 'rebase',
+        disabled: intoOff,
+        hint: intoHint,
+        run: () => void rebaseOnto(ref.full, ref.name)
+      }
+    )
+  }
+  if (ref.kind === 'local') {
+    entries.push(
+      'separator',
+      { label: 'Rename…', icon: 'edit', run: () => void renameBranch(ref.name) },
+      { label: 'Delete', icon: 'trash', disabled: current, hint: 'The current branch cannot be deleted', run: () => void deleteBranch(ref.name) }
+    )
+  }
+  entries.push(
+    'separator',
+    { icon: 'search', label: filter.branches?.includes(ref.full) ? 'Show All Branches' : `Show Only '${ref.name}'`, run: () => applyFilter({ branches: filter.branches?.includes(ref.full) ? [] : [ref.full] }) },
+    { label: 'Copy Name', icon: 'copy', run: () => copyText(ref.name) }
+  )
+  showMenu(event.clientX, event.clientY, entries)
+}
+
+/** Checks out `target`, asking first what to do with uncommitted changes. */
+async function checkout(target: string): Promise<void> {
+  if (!repo) return
+  const label = /^[0-9a-f]{40}$/.test(target) ? shortHash(target) : target
+  let stash = false
+  try {
+    const { files } = await api.dirty(repo.root)
+    if (files.length) {
+      const choice = await askDirtyCheckout(label, files)
+      if (!choice) return
+      stash = choice === 'stash'
+    }
+  } catch {
+    // Let git decide: it refuses a checkout that would lose changes.
+  }
+  await act({ kind: 'checkout', target, ...(stash ? { stash } : {}) }, `Checking out ${label}…`)
+}
+
+async function mergeInto(full: string, name: string): Promise<void> {
+  if (await confirm('Merge', `Merge ${name} into ${repo?.head.branch}? A conflict aborts the merge and leaves the branch as it is.`, 'Merge')) {
+    await act({ kind: 'merge', ref: full }, `Merging ${name}…`)
+  }
+}
+
+async function rebaseOnto(full: string, name: string): Promise<void> {
+  const text = `Rebase ${repo?.head.branch} onto ${name}? Its own commits are replayed on top of ${name}; a conflict aborts the rebase. Rewriting pushed commits requires a force push.`
+  if (await confirm('Rebase', text, 'Rebase')) await act({ kind: 'rebaseOnto', ref: full }, `Rebasing onto ${name}…`)
+}
+
+async function renameBranch(name: string): Promise<void> {
+  const answer = await askName(`Rename '${name}'`, 'New branch name', 'Rename')
+  if (answer && answer.name !== name) await act({ kind: 'renameBranch', name, newName: answer.name }, 'Renaming…')
+}
+
+async function deleteBranch(name: string): Promise<void> {
+  if (!(await confirm('Delete Branch', `Delete the local branch ${name}?`, 'Delete', true))) return
+  const result = await act({ kind: 'deleteBranch', name }, `Deleting ${name}…`, true)
+  if (!result?.needsForce) return
+  const text = `${name} is not fully merged: its commits that are in no other branch will be lost (git can still recover them for a while from the reflog). Delete it anyway?`
+  if (await confirm('Branch Not Merged', text, 'Force Delete', true)) await act({ kind: 'deleteBranch', name, force: true }, `Deleting ${name}…`)
+}
+
+async function fetchAll(): Promise<void> {
+  await act({ kind: 'fetch' }, 'Fetching…')
+}
+
+async function pushBranch(): Promise<void> {
+  if (!repo) return
+  const root = repo.root
+  const done = busy('Checking what to push…')
+  let first
+  try {
+    first = await api.pushCheck(root)
+  } catch (error) {
+    first = { ok: false as const, reason: errorMessage(error) }
+  } finally {
+    done()
+  }
+  if (!first.ok) return showBanner(first.reason, 'error')
+  const choice = await askPush(first, (remote, remoteBranch) => api.pushCheck(root, remote, remoteBranch))
+  if (!choice) return
+  const { plan, force } = choice
+  await act(
+    {
+      kind: 'push',
+      branch: plan.branch,
+      hash: plan.hash,
+      remote: plan.remote,
+      remoteBranch: plan.remoteBranch,
+      setUpstream: plan.publish,
+      ...(force ? { force, ...(plan.remoteHash ? { expect: plan.remoteHash } : {}) } : {})
+    },
+    force ? 'Force pushing…' : 'Pushing…'
+  )
+}
+
+// ---------- Selection ----------
+
+function selectedHashes(): string[] {
+  return [...selected].sort((a, b) => (indexByHash.get(a) ?? 0) - (indexByHash.get(b) ?? 0))
+}
+
+function ensureVisible(index: number): void {
+  const top = rowTop(index)
+  if (top < viewport.scrollTop) viewport.scrollTop = top
+  else if (top + ROW_HEIGHT > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = top + ROW_HEIGHT - viewport.clientHeight
+}
+
+function selectionChanged(): void {
+  renderRows()
+  updateDetails()
+}
+
+function selectOnly(index: number): void {
+  if (index < 0 || index >= rows.length) return
+  selected.clear()
+  selected.add(rows[index].hash)
+  anchor = cursor = index
+  ensureVisible(index)
+  selectionChanged()
+}
+
+function selectRange(to: number, additive: boolean): void {
+  if (to < 0 || to >= rows.length) return
+  if (anchor < 0) anchor = to
+  if (!additive) selected.clear()
+  for (let i = Math.min(anchor, to); i <= Math.max(anchor, to); i++) selected.add(rows[i].hash)
+  cursor = to
+  ensureVisible(to)
+  selectionChanged()
+}
+
+async function jumpTo(hash: string): Promise<void> {
+  const token = loadToken
+  let index = indexByHash.get(hash)
+  while (index === undefined && (hasMore || loading) && rows.length < 10_000) {
+    // A load already in flight makes loadMore() return at once: wait for it instead of spinning.
+    if (loading) await new Promise((resolve) => setTimeout(resolve, 50))
+    else {
+      const before = rows.length
+      await loadMore()
+      if (rows.length === before && !loading) break
+    }
+    // The log was reloaded (a filter, a refresh, a double-click on a branch): this jump is stale.
+    if (token !== loadToken) return
+    index = indexByHash.get(hash)
+  }
+  if (index === undefined) {
+    showBanner(isFiltered() || filter.branches?.length ? 'That commit is hidden by the current filters.' : 'That commit is not in the log.', 'info')
+    return
+  }
+  selectOnly(index)
+  viewport.scrollTop = Math.max(0, rowTop(index) - viewport.clientHeight / 3)
+  viewport.focus({ preventScroll: true })
+}
+
+viewport.addEventListener('mousedown', (event) => {
+  const row = (event.target as HTMLElement).closest<HTMLElement>('.row')
+  if (!row) return
+  const index = Number(row.dataset.index)
+  const hash = rows[index]?.hash
+  if (!hash) return
+  viewport.focus({ preventScroll: true })
+  if (event.button === 2) {
+    if (!selected.has(hash)) selectOnly(index)
+    return
+  }
+  if (event.button !== 0) return
+  if (event.shiftKey) selectRange(index, event.ctrlKey || event.metaKey)
+  else if (event.ctrlKey || event.metaKey) {
+    if (selected.has(hash)) selected.delete(hash)
+    else selected.add(hash)
+    anchor = cursor = index
+    selectionChanged()
+  } else selectOnly(index)
+})
+
+viewport.addEventListener('contextmenu', (event) => {
+  event.preventDefault()
+  if ((event.target as HTMLElement).closest('.row[data-index]') && selected.size) commitMenu(event.clientX, event.clientY)
+})
+
+viewport.addEventListener('keydown', (event) => {
+  const mod = event.ctrlKey || event.metaKey
+  const page = Math.max(1, Math.floor(viewport.clientHeight / ROW_HEIGHT) - 1)
+  const move = (to: number) => {
+    to = clamp(to, 0, rows.length - 1)
+    if (event.shiftKey) selectRange(to, mod)
+    else selectOnly(to)
+  }
+  switch (event.key) {
+    case 'ArrowDown':
+      move(cursor + 1)
+      break
+    case 'ArrowUp':
+      move(cursor < 0 ? 0 : cursor - 1)
+      break
+    case 'PageDown':
+      move(cursor + page)
+      break
+    case 'PageUp':
+      move(cursor - page)
+      break
+    case 'Home':
+      move(0)
+      break
+    case 'End':
+      move(rows.length - 1)
+      break
+    case 'a':
+    case 'A':
+      if (!mod) return
+      rows.forEach((r) => selected.add(r.hash))
+      anchor = 0
+      cursor = rows.length - 1
+      selectionChanged()
+      break
+    case 'c':
+    case 'C':
+      if (!mod || !selected.size) return
+      copyHashes()
+      break
+    case 'F10':
+      if (!event.shiftKey) return
+    // falls through
+    case 'ContextMenu': {
+      if (!selected.size) return
+      const rect = viewport.getBoundingClientRect()
+      commitMenu(rect.left + 40, rect.top + Math.max(0, rowTop(cursor + 1) - viewport.scrollTop))
+      break
+    }
+    case 'Escape':
+      if (!selected.size) return
+      selected.clear()
+      selectionChanged()
+      break
+    default:
+      return
+  }
+  event.preventDefault()
+})
+
+function copyHashes(): void {
+  const hashes = selectedHashes()
+  if (copyText(hashes.join(' '))) showBanner(`Copied ${hashes.length === 1 ? shortHash(hashes[0]) : `${hashes.length} hashes`}.`, 'success')
+}
+
+// ---------- Details ----------
+
+/** Opens the file's changes in their own editor tab; falls back to the in-frame viewer (no workspace, web client). */
+async function showDiff(root: string, hash: string, files: FileChange[], index: number): Promise<void> {
+  try {
+    const workspaceId = repo?.workspaceId ?? docWorkspaceId
+    const result = await api.openDiffTab({ root, hash, files, index, ...(workspaceId ? { workspaceId } : {}) })
+    if (result.ok) return
+  } catch {
+    // Fall through to the in-frame viewer.
+  }
+  openDiff({
+    root,
+    hash,
+    files,
+    index,
+    mode: prefs.diffMode,
+    wholeFile: !prefs.diffChangesOnly,
+    onPrefs: (mode, wholeFile) => {
+      prefs.diffMode = mode
+      prefs.diffChangesOnly = !wholeFile
+      savePrefs()
+    }
+  })
+}
+
+let detailsTimer: ReturnType<typeof setTimeout> | undefined
+let detailsToken = 0
+function updateDetails(): void {
+  clearTimeout(detailsTimer)
+  if (!prefs.details) return
+  const hashes = selectedHashes()
+  if (!repo || !hashes.length) {
+    renderPlaceholder(detailsPane, repo ? 'Select a commit to see its details.' : '')
+    return
+  }
+  const token = ++detailsToken
+  const root = repo.root
+  if (hashes.length > 1) {
+    const commits = hashes.map((hash) => rows[indexByHash.get(hash)!]).filter(Boolean)
+    const host = {
+      select: (hash: string) => void jumpTo(hash),
+      openDiff: (files: FileChange[], index: number) => void showDiff(root, hashes[0], files, index)
+    }
+    const tooMany = hashes.length > 200 ? 'Select at most 200 commits to see the files they changed.' : null
+    renderMany(detailsPane, commits, tooMany, host)
+    if (tooMany) return
+    detailsTimer = setTimeout(async () => {
+      let files: FileChange[] | string
+      try {
+        files = (await api.selectionFiles(root, hashes)).files
+      } catch (error) {
+        files = errorMessage(error)
+      }
+      if (token === detailsToken) renderMany(detailsPane, commits, files, host)
+    }, 150)
+    return
+  }
+  detailsTimer = setTimeout(async () => {
+    try {
+      const details = await api.details(root, hashes[0])
+      if (token === detailsToken)
+        renderDetails(detailsPane, details, {
+          select: (hash) => void jumpTo(hash),
+          openDiff: (index) => void showDiff(root, details.hash, details.files, index)
+        })
+    } catch (error) {
+      if (token === detailsToken) renderPlaceholder(detailsPane, errorMessage(error))
+    }
+  }, 80)
+}
+
+// ---------- Actions ----------
+
+const UNDOABLE = new Set<ActionRequest['kind']>(['cherryPick', 'revert', 'reset', 'squash', 'fixup', 'drop', 'reword', 'rebase'])
+
+async function act(action: ActionRequest, progress: string, quietNeedsForce = false): Promise<ActionResult | null> {
+  if (!repo) return null
+  const root = repo.root
+  const done = busy(progress)
+  let result: ActionResult
+  try {
+    result = await api.run(root, action)
+  } catch (error) {
+    result = { ok: false, message: errorMessage(error) }
+  } finally {
+    done()
+  }
+  if (result.ok) {
+    const previous = result.previousHead
+    const undo = previous && UNDOABLE.has(action.kind)
+      ? [{ label: 'Undo', run: () => void act({ kind: 'reset', hash: previous, mode: 'keep' }, 'Undoing…').then((r) => r?.ok && showBanner(`Restored HEAD to ${shortHash(previous)}.`, 'success')) }]
+      : []
+    showBanner(result.message, 'success', undo)
+    // A renamed or deleted branch can't stay in the branch filter: the log would fail to load.
+    if ((action.kind === 'deleteBranch' || action.kind === 'renameBranch') && filter.branches?.includes(`refs/heads/${action.name}`)) {
+      filter = { ...filter, branches: filter.branches.filter((b) => b !== `refs/heads/${action.name}`) }
+      filterBar.update()
+    }
+  } else if (!(quietNeedsForce && result.needsForce)) showBanner(result.message, 'error')
+  await refreshAll()
+  return result
+}
+
+async function checked(kind: RewriteKind, hashes: string[]) {
+  if (!repo) return null
+  const done = busy('Checking…')
+  try {
+    const check = await api.check(repo.root, kind, hashes)
+    if (!check.ok) {
+      showBanner(check.reason, 'error')
+      return null
+    }
+    return check
+  } catch (error) {
+    showBanner(errorMessage(error), 'error')
+    return null
+  } finally {
+    done()
+  }
+}
+
+const confirmPushed = (pushed: string[], what: string) =>
+  pushed.length ? confirm('Commits Already Pushed', pushedWarning(pushed), what, true) : Promise.resolve(true)
+
+async function squash(hashes: string[]): Promise<void> {
+  const check = await checked('squash', hashes)
+  if (!check) return
+  const chosen = new Set(hashes)
+  const combined = check.commits.filter((c) => chosen.has(c.hash)).map((c) => c.message).join('\n\n')
+  const message = await editMessage('Squash Commits', combined, 'Squash', check.pushed.length ? pushedWarning(check.pushed) : null)
+  if (message) await act({ kind: 'squash', hashes, message }, `Squashing ${hashes.length} commits…`)
+}
+
+async function fixup(hashes: string[]): Promise<void> {
+  const check = await checked('fixup', hashes)
+  if (check && (await confirmPushed(check.pushed, 'Fixup'))) await act({ kind: 'fixup', hashes }, 'Fixing up…')
+}
+
+async function drop(hashes: string[]): Promise<void> {
+  const check = await checked('drop', hashes)
+  if (check && (await confirmPushed(check.pushed, 'Drop'))) await act({ kind: 'drop', hashes }, `Dropping ${hashes.length} commit${hashes.length > 1 ? 's' : ''}…`)
+}
+
+async function reword(hash: string): Promise<void> {
+  const check = await checked('reword', [hash])
+  if (!check) return
+  const current = check.commits.find((c) => c.hash === hash)?.message ?? ''
+  const message = await editMessage('Edit Commit Message', current, 'OK', check.pushed.length ? pushedWarning(check.pushed) : null)
+  if (message && message !== current) await act({ kind: 'reword', hash, message }, 'Updating message…')
+}
+
+async function rebaseFrom(hash: string): Promise<void> {
+  const check = await checked('rebase', [hash])
+  if (!check) return
+  const plan = await askRebasePlan(check.commits, check.pushed)
+  if (plan) await act({ kind: 'rebase', plan }, 'Rebasing…')
+}
+
+async function undoCommit(hash: string): Promise<void> {
+  const check = await checked('undo', [hash])
+  if (check && (await confirmPushed(check.pushed, 'Undo Commit'))) await act({ kind: 'undo', hash }, 'Undoing commit…')
+}
+
+async function newBranch(hash: string): Promise<void> {
+  const answer = await askName('Create New Branch', 'Branch name', 'Create', { label: 'Checkout branch', checked: true })
+  if (answer) await act({ kind: 'branch', hash, name: answer.name, checkout: answer.checked }, 'Creating branch…')
+}
+
+async function newTag(hash: string): Promise<void> {
+  const answer = await askName(`Create Tag on ${shortHash(hash)}`, 'Tag name', 'Create')
+  if (answer) await act({ kind: 'tag', hash, name: answer.name }, 'Creating tag…')
+}
+
+async function reset(hash: string): Promise<void> {
+  const mode = await askReset(repo?.head.branch ?? null, hash)
+  if (!mode) return
+  if (mode === 'hard' && !(await confirm('Hard Reset', 'Uncommitted changes will be lost. Continue?', 'Reset', true))) return
+  await act({ kind: 'reset', hash, mode }, 'Resetting…')
+}
+
+async function createPatch(hashes: string[]): Promise<void> {
+  if (!repo) return
+  const root = repo.root
+  const done = busy('Creating patch…')
+  let preview
+  try {
+    preview = await api.patch(root, hashes)
+  } catch (error) {
+    preview = { ok: false as const, reason: errorMessage(error) }
+  } finally {
+    done()
+  }
+  if (!preview.ok) return showBanner(preview.reason, 'error')
+  const choice = await askPatch(hashes.length, preview.size, preview.name, Boolean(preview.text))
+  if (!choice) return
+  if (choice.action === 'copy') {
+    if (copyText(preview.text!)) showBanner(`Copied the patch of ${hashes.length === 1 ? shortHash(hashes[0]) : `${hashes.length} commits`}.`, 'success')
+    else showBanner('Could not copy to the clipboard.', 'error')
+    return
+  }
+  try {
+    let saved = await api.patch(root, hashes, choice.path)
+    if (!saved.ok && saved.exists) {
+      if (!(await confirm('File Already Exists', `${saved.reason} Overwrite it?`, 'Overwrite', true))) return
+      saved = await api.patch(root, hashes, choice.path, true)
+    }
+    if (!saved.ok) return showBanner(saved.reason, 'error')
+    const path = saved.path!
+    showBanner(`Patch saved to ${path}.`, 'success', [{ label: 'Copy Path', run: () => void copyText(path) }])
+  } catch (error) {
+    showBanner(errorMessage(error), 'error')
+  }
+}
+
+function commitMenu(x: number, y: number): void {
+  if (!repo) return
+  const hashes = selectedHashes()
+  const commits = hashes.map((hash) => rows[indexByHash.get(hash)!])
+  const n = hashes.length
+  const single = n === 1 ? commits[0] : null
+  const merges = commits.some((c) => c.parents.length > 1)
+  const operation = repo.operation
+  const rewriteHint = operation ? `A ${operation} is in progress` : rewriteBlocker(hashes, false)
+  const rewriteOff = Boolean(rewriteHint)
+  const fixupHint = operation ? rewriteHint : rewriteBlocker(hashes, n === 1)
+  const plural = n > 1 ? 's' : ''
+
+  const entries: MenuEntry[] = [
+    { label: `Copy Revision Number${plural}`, icon: 'copy', shortcut: 'Ctrl+C', run: copyHashes },
+    {
+      label: 'Cherry-Pick',
+      icon: 'cherry',
+      disabled: Boolean(operation) || (!isFiltered() && hashes.some((hash) => reachable.has(hash))) || merges,
+      hint: operation ? `A ${operation} is in progress` : merges ? 'Merge commits cannot be cherry-picked here' : 'Already in the current branch',
+      run: () => void act({ kind: 'cherryPick', hashes }, 'Cherry-picking…')
+    },
+    {
+      label: 'Create Patch…',
+      icon: 'patch',
+      disabled: merges,
+      hint: 'Merge commits cannot be exported as a patch',
+      run: () => void createPatch(hashes)
+    },
+    'separator',
+    { label: 'Checkout Revision', icon: 'checkout', disabled: !single, hint: 'Select one commit', run: () => void checkout(single!.hash) }
+  ]
+  if (single) {
+    for (const label of refLabels(single.refs, repo.head.branch)) {
+      if (label.kind === 'local' && !label.current) {
+        const name = label.refs[0]
+        entries.push({ label: `Checkout '${name}'`, run: () => void checkout(name) })
+      } else if (label.kind === 'remote') {
+        const name = label.text.slice(label.text.indexOf('/') + 1)
+        if (!refs?.locals.some((l) => l.name === name)) {
+          entries.push({ label: `Checkout '${label.text}' as '${name}'`, run: () => void checkout(name) })
+        }
+      }
+    }
+  }
+  entries.push(
+    'separator',
+    {
+      label: 'Reset Current Branch to Here…',
+      icon: 'reset',
+      disabled: !single || Boolean(operation),
+      hint: operation ? `A ${operation} is in progress` : 'Select one commit',
+      run: () => void reset(single!.hash)
+    },
+    {
+      label: `Revert Commit${plural}`,
+      icon: 'revert',
+      disabled: Boolean(operation) || merges,
+      hint: operation ? `A ${operation} is in progress` : 'Merge commits cannot be reverted here',
+      run: () => void act({ kind: 'revert', hashes }, 'Reverting…')
+    },
+    {
+      label: 'Undo Commit…',
+      icon: 'undo',
+      disabled: !single || single.hash !== repo.head.hash || Boolean(operation),
+      hint: 'Only the latest commit can be undone',
+      run: () => void undoCommit(single!.hash)
+    },
+    'separator',
+    { label: 'Edit Commit Message…', icon: 'edit', disabled: !single || rewriteOff, hint: rewriteHint ?? 'Select one commit', run: () => void reword(single!.hash) },
+    { label: n > 1 ? 'Fixup Commits' : 'Fixup into Previous', icon: 'fixup', disabled: Boolean(fixupHint), hint: fixupHint, run: () => void fixup(hashes) },
+    { label: 'Squash Commits…', icon: 'squash', disabled: n < 2 || rewriteOff, hint: rewriteHint ?? 'Select at least two commits', run: () => void squash(hashes) },
+    { label: `Drop Commit${plural}`, icon: 'drop', disabled: rewriteOff, hint: rewriteHint, run: () => void drop(hashes) },
+    {
+      label: 'Interactively Rebase from Here…',
+      icon: 'rebase',
+      disabled: !single || rewriteOff,
+      hint: rewriteHint ?? 'Select one commit',
+      run: () => void rebaseFrom(single!.hash)
+    },
+    'separator',
+    { label: 'New Branch…', icon: 'branch', disabled: !single, hint: 'Select one commit', run: () => void newBranch(single!.hash) },
+    { label: 'New Tag…', icon: 'tag', disabled: !single, hint: 'Select one commit', run: () => void newTag(single!.hash) }
+  )
+  showMenu(x, y, entries, viewport)
+}
+
+// ---------- Toolbar & host events ----------
+
+treeToggle.addEventListener('click', () => {
+  prefs.branches = !prefs.branches
+  savePrefs()
+  applyLayout()
+})
+detailsToggle.addEventListener('click', () => {
+  prefs.details = !prefs.details
+  savePrefs()
+  applyLayout()
+  updateDetails()
+})
+refreshButton.addEventListener('click', () => void refreshAll())
+fetchButton.addEventListener('click', () => void fetchAll())
+pushButton.addEventListener('click', () => void pushBranch())
+statusChip.addEventListener('click', () => {
+  const hash = refs?.head.hash ?? repo?.head.hash
+  if (hash) void jumpTo(hash)
+})
+tabButton.addEventListener('click', async () => {
+  try {
+    const result = await api.openTab(repo?.workspaceId)
+    if (!result.ok) showBanner(result.reason ?? 'Could not open the editor tab.', 'error')
+  } catch (error) {
+    showBanner(errorMessage(error), 'error')
+  }
+})
+
+orca.plugin.on('repo.changed', ({ root }: { root: string }) => {
+  if (root === repo?.root) scheduleRefresh()
+})
+
+orca.plugin.on('repo.worktree', ({ root }: { root: string }) => {
+  if (root === repo?.root) void refreshUncommitted()
+})
+
+if (MODE === 'panel') {
+  // The first event is the current context (already handled by start()); later ones mean focus moved.
+  let lastContext: string | null = null
+  orca.on('workspace.changed', ({ context }: { context: { branch: string; displayName: string } | null }) => {
+    const key = context ? `${context.displayName}\n${context.branch}` : ''
+    const first = lastContext === null
+    if (key === lastContext) return
+    lastContext = key
+    if (!first) void start()
+  })
+}
+
+let lastFocusRefresh = 0
+addEventListener('focus', () => {
+  if (Date.now() - lastFocusRefresh < 3000) return
+  lastFocusRefresh = Date.now()
+  if (repo) scheduleRefresh(50)
+})
+
+applyLayout()
+renderEmpty()
+void start()

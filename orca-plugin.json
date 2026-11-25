@@ -1,0 +1,75 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "id": "git-log",
+  "name": "Git Log",
+  "version": "0.4.0",
+  "description": "Git log: commit graph, branches, filters, details and file diffs, with multi-select squash, fixup, drop, reword, interactive rebase, cherry-pick, revert and reset from a right-click menu.",
+  "license": "MIT",
+  "repository": "https://github.com/emamalet/Orca-git-log-panel",
+  "icon": "images/icon.png",
+  "cover": { "path": "images/cover.png", "alt": "Git Log title and logo next to the commit graph with three selected commits and the right-click menu to squash, fixup or drop them" },
+  "screenshots": [
+    { "path": "images/log-dark.png", "alt": "Commit log with three selected commits and the right-click menu open", "caption": "Multi-select commits and rewrite them from the context menu", "theme": "dark" },
+    { "path": "images/diff-dark.png", "alt": "Side-by-side diff of a TypeScript file with added and removed lines highlighted", "caption": "Double-click a changed file to see its diff, side by side or unified", "theme": "dark" },
+    { "path": "images/rebase-dark.png", "alt": "Interactive rebase dialog listing four commits with pick actions", "caption": "Interactive rebase: reorder, squash, fixup, reword or drop", "theme": "dark" },
+    { "path": "images/log-light.png", "alt": "Commit graph with branch tree and commit details in the light theme", "caption": "Commit graph, branch tree and details", "theme": "light" }
+  ],
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker/main.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "log",
+        "title": "Git Log",
+        "icon": "branch",
+        "entry": "src/ui/panel.html"
+      }
+    ],
+    "customEditors": [
+      {
+        "id": "log-tab",
+        "title": "Git Log",
+        "extensions": [".gitlog"],
+        "entry": "src/ui/editor.html"
+      },
+      {
+        "id": "diff-tab",
+        "title": "Git Diff",
+        "extensions": [".gitdiff"],
+        "entry": "src/ui/diff.html"
+      }
+    ],
+    "commands": [
+      { "id": "open-tab", "title": "Git Log: Open in Editor Tab", "when": "workspace" }
+    ],
+    "settings": [
+      {
+        "key": "gitPath",
+        "title": "Git executable",
+        "description": "Path or name of the git binary used by the log.",
+        "type": "string",
+        "default": "git",
+        "maxLength": 1024
+      },
+      {
+        "key": "pageSize",
+        "title": "Commits per page",
+        "description": "How many commits are loaded at once while scrolling.",
+        "type": "integer",
+        "default": 300,
+        "minimum": 50,
+        "maximum": 2000
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "settings:own" }
+  ]
+}
