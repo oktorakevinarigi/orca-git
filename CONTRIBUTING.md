@@ -15,6 +15,10 @@ Codex, Cursor…), the same rules apply. AI assistants find them in [AGENTS.md](
    node scripts/check-release.mjs
    ```
 
+   `npm test`, `npm run validate` and `npm run check` do the same through `scripts/orca.mjs`, which
+   finds a working Orca CLI (`$ORCA_CLI_COMMAND`, `orca` on PATH, then the one inside Orca.app on
+   macOS) when the `orca` launcher on PATH cannot locate the app.
+
 ## Versions, changelog and tags
 
 Orca installs the latest `vX.Y.Z` tag, so **every change merged into `main` is a release**. The

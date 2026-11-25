@@ -1,5 +1,6 @@
 import type { DiffHunk, FileDiff } from '../shared/protocol.ts'
-import type { Git } from './git.ts'
+import { lastLines, type Git } from './git.ts'
+import { readUntracked, worktreeBase, WORKTREE } from './log.ts'
 
 /** Lines kept per file; beyond this the diff is marked truncated. */
 export const MAX_DIFF_LINES = 20_000
@@ -61,6 +62,7 @@ export async function readFileDiff(
 ): Promise<FileDiff> {
   if (!HASH.test(hash)) throw new Error(`Invalid commit: ${hash}`)
   if (!path || typeof path !== 'string') throw new Error('Missing file path.')
+  if (hash === WORKTREE) return readWorktreeDiff(git, path, oldPath, wholeFile)
   if (range && !(HASH.test(range.base) && HASH.test(range.tip))) throw new Error('Invalid commit range.')
   const parents = range ? [range.base] : (await git.out(['rev-list', '--parents', '-n1', hash, '--'])).trim().split(' ').slice(1)
   const to = range ? range.tip : hash
@@ -70,4 +72,19 @@ export async function readFileDiff(
     ? ['diff', ...options, parents[0], to, '--', ...paths]
     : ['diff-tree', '-p', '--root', '--no-commit-id', ...options, hash, '--', ...paths]
   return { path, ...(oldPath ? { oldPath } : {}), ...parseUnifiedDiff(await git.out(args)) }
+}
+
+/** The uncommitted changes to `path`: the work tree against HEAD, or the whole file when it is untracked. */
+async function readWorktreeDiff(git: Git, path: string, oldPath: string | undefined, wholeFile: boolean): Promise<FileDiff> {
+  const options = ['--no-ext-diff', '--no-textconv', '-M', `-U${wholeFile ? 1_000_000 : 3}`]
+  // Checked against git's own list, so --no-index never reads a file outside the work tree.
+  if ((await readUntracked(git, [literal(path)])).includes(path)) {
+    const result = await git.run(['diff', '--no-index', ...options, '--', '/dev/null', path])
+    // --no-index exits with 1 when the files differ, which they always do here.
+    if (result.code !== 0 && result.code !== 1) throw new Error(lastLines(result.stderr) || 'git diff failed')
+    return { path, ...parseUnifiedDiff(result.stdout) }
+  }
+  const paths = [...(oldPath && oldPath !== path ? [literal(oldPath)] : []), literal(path)]
+  const base = await worktreeBase(git)
+  return { path, ...(oldPath ? { oldPath } : {}), ...parseUnifiedDiff(await git.out(['diff', ...options, base, '--', ...paths])) }
 }

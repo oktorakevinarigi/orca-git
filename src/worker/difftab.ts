@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { isAbsolute, join, relative } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { DiffTabRequest, FileChange } from '../shared/protocol.ts'
+import { WORKTREE } from './log.ts'
 import type { ListedWorkspace, Workspace } from './repo.ts'
 
 /** Folder, inside the workspace, holding the small files that diff tabs open. */
@@ -16,7 +17,21 @@ export function diffAnchorName(files: FileChange[], index: number, hash: string)
   const name = baseName(path)
   const parts = path.split('/')
   const twin = files.some((f, i) => i !== index && baseName(f.path) === name) && parts.length > 1
-  return `${safe(name)}${twin ? ` (${safe(parts[parts.length - 2])})` : ''} @${hash.slice(0, 8)}.gitdiff`
+  const revision = hash === WORKTREE ? ' (uncommitted)' : ` @${hash.slice(0, 8)}`
+  return `${safe(name)}${twin ? ` (${safe(parts[parts.length - 2])})` : ''}${revision}.gitdiff`
+}
+
+/**
+ * `path` (relative to the repository at `root`) as a path relative to the workspace folder, for
+ * `editor.open`; null when it is not a plain relative path or lies outside the workspace.
+ */
+export function workspaceFilePath(workspacePath: string, root: string, path: string): string | null {
+  if (typeof path !== 'string' || !path || path.length > 4096 || isAbsolute(path) || path.includes('\0')) return null
+  const outside = (rel: string) => !rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)
+  const full = resolve(root, path)
+  const inWorkspace = relative(workspacePath, full)
+  if (outside(relative(root, full)) || outside(inWorkspace)) return null
+  return inWorkspace.split(sep).join('/')
 }
 
 export function validDiffRequest(input: unknown): DiffTabRequest {

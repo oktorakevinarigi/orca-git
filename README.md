@@ -19,7 +19,9 @@ a details pane with file diffs, and a right-click menu to rewrite history on a m
 - **Commit graph**: colored lanes with rounded curves at forks and merges, a fixed-width graph column,
   branch and tag labels framed in their lane color in front of the subject (a branch's remotes shown
   inside its label), every commit drawn as a solid dot. Uncommitted changes show as an
-  "Uncommitted Changes (N)" row on top, joined to the HEAD commit by a dashed line.
+  "Uncommitted Changes (N)" row on top, joined to the HEAD commit by a dashed line. Select it to list
+  the changed files of the work tree (staged, unstaged and untracked), click one to see its changes
+  from HEAD, or use its **Open file** button to open it in the editor.
 - **Filters**: text or hash (with regex `.*` and match case `Cc`), Branch, User, Date and Paths.
 - **Branch tree**: Local, Remote and Tags; click a branch to show only its commits (click it again, or
   **Show all**, to see every branch; Ctrl+click to show several), double-click it or use its locate

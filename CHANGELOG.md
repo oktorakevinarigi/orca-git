@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — 2026-11-25
+
+The "Uncommitted Changes" row can now be selected, by a click or with the arrow keys and Home. The
+details pane then lists every changed file of the work tree against HEAD as a folder tree: staged and
+unstaged edits, deletions, renames and untracked files (marked `?` and shown in green, one row per
+file even inside a new folder). A click on a file opens its changes in a diff tab, from HEAD to the
+working tree, with an untracked file shown as wholly added; the diff header names the sides "HEAD" and
+"Working tree". A new "Open file" button, on each file row and in the diff header, opens the file
+itself in an editor tab. The list follows the work tree while it is selected, and the row's count now
+matches the number of files listed.
+
 ## 0.4.0 — 2026-11-25
 
 The commit graph has a new look: thicker lines that bend in smooth curves where branches fork and

@@ -73,6 +73,36 @@ test('resolves the focused workspace, pages the log and opens the editor tab', a
   }
 })
 
+test('lists the uncommitted files, diffs them and opens a work-tree file in the editor', async () => {
+  const root = fixture()
+  try {
+    const h = host(root)
+    const worker = await mountWorker(main, { host: h })
+    await worker.request('repo.resolve', {})
+    mkdirSync(join(root, 'src'))
+    writeFileSync(join(root, 'src', 'new.ts'), 'export {}\n')
+    writeFileSync(join(root, 'one.txt'), 'uno')
+
+    const { files } = await worker.request('repo.uncommittedFiles', { root })
+    assert.deepEqual(files, [
+      { status: 'M', path: 'one.txt' },
+      { status: '?', path: 'src/new.ts' }
+    ])
+    assert.deepEqual(await worker.request('repo.uncommitted', { root }), { count: 2 })
+    const diff = await worker.request('file.diff', { root, hash: '0'.repeat(40), path: 'src/new.ts' })
+    assert.deepEqual(diff.hunks[0].lines, [{ kind: '+', text: 'export {}', new: 1 }])
+
+    assert.deepEqual(await worker.request('file.open', { root, path: 'src/new.ts', workspaceId: 'wt-1' }), { ok: true })
+    assert.deepEqual(h.callsOf('editor.open'), [{ workspaceId: 'wt-1', path: 'src/new.ts' }])
+    assert.equal((await worker.request('file.open', { root, path: '../elsewhere.txt' })).ok, false)
+    assert.equal((await worker.request('file.open', { root, path: 'missing.txt' })).ok, false)
+    assert.equal(h.callsOf('editor.open').length, 1)
+    await worker.deactivate()
+  } finally {
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
 test('a workspace that only exists on a remote host is reported as unsupported', async () => {
   const worker = await mountWorker(main, {
     host: mockHost({

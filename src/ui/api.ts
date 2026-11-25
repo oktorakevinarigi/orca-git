@@ -52,6 +52,9 @@ export const api = {
     orca.plugin.request('selection.files', { root, hashes }, LONG),
   dirty: (root: string): Promise<{ files: string[] }> => orca.plugin.request('repo.dirty', { root }),
   uncommitted: (root: string): Promise<{ count: number }> => orca.plugin.request('repo.uncommitted', { root }),
+  uncommittedFiles: (root: string): Promise<{ files: FileChange[] }> => orca.plugin.request('repo.uncommittedFiles', { root }, LONG),
+  openFile: (root: string, path: string, workspaceId?: string | null): Promise<{ ok: boolean; reason?: string }> =>
+    orca.plugin.request('file.open', { root, path, ...(workspaceId ? { workspaceId } : {}) }),
   pushCheck: (root: string, remote?: string, remoteBranch?: string): Promise<PushPlan> =>
     orca.plugin.request('push.check', { root, ...(remote ? { remote } : {}), ...(remoteBranch ? { remoteBranch } : {}) }, LONG),
   patch: (root: string, hashes: string[], path?: string, overwrite = false): Promise<PatchResult> =>

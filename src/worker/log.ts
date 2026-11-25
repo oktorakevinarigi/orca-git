@@ -132,23 +132,40 @@ export async function readStatus(git: Git): Promise<BranchStatus> {
   return { upstream: name, ahead: ahead || 0, behind: behind || 0 }
 }
 
-/** Counts the files `git status --porcelain -z` lists; a rename or copy is one file (its old path follows it). */
-export function countStatusEntries(stdout: string): number {
-  const entries = stdout.split('\0')
-  let count = 0
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i]
-    if (entry.length < 4) continue
-    count++
-    if (entry[0] === 'R' || entry[0] === 'C') i++
-  }
-  return count
+/** Stands for the work tree where a commit hash is expected: git's null object id. */
+export const WORKTREE = '0'.repeat(40)
+/** Status letter of a file git does not track yet. */
+export const UNTRACKED = '?'
+
+/** What uncommitted changes are measured against: HEAD, or the empty tree before the first commit. */
+export async function worktreeBase(git: Git): Promise<string> {
+  const head = await git.run(['rev-parse', '-q', '--verify', 'HEAD^{commit}'])
+  return (head.ok && head.stdout.trim()) || EMPTY_TREE
+}
+
+/** Untracked files that are not ignored, one path per file (never a folder). */
+export async function readUntracked(git: Git, paths: string[] = []): Promise<string[]> {
+  const result = await git.run(['ls-files', '--others', '--exclude-standard', '-z', '--', ...paths])
+  return result.ok ? result.stdout.split('\0').filter(Boolean) : []
+}
+
+/**
+ * The work tree against HEAD: staged and unstaged changes, plus untracked files (status `?`).
+ * Empty for a bare repository or when git fails.
+ */
+export async function readUncommittedFiles(git: Git): Promise<FileChange[]> {
+  const base = await worktreeBase(git)
+  const [diff, untracked] = await Promise.all([git.run(['diff', '--name-status', '-z', '-M', base, '--']), readUntracked(git)])
+  if (!diff.ok) return []
+  const tracked = parseNameStatus(diff.stdout)
+  const known = new Set(tracked.map((f) => f.path))
+  const added = untracked.filter((path) => !known.has(path)).map((path) => ({ status: UNTRACKED, path }))
+  return [...tracked, ...added].sort((a, b) => a.path.localeCompare(b.path))
 }
 
 /** Files with uncommitted changes, untracked ones included; 0 for a bare repository or when git fails. */
 export async function readUncommitted(git: Git): Promise<number> {
-  const result = await git.run(['status', '--porcelain', '-z', '--untracked-files=normal'])
-  return result.ok ? countStatusEntries(result.stdout) : 0
+  return (await readUncommittedFiles(git)).length
 }
 
 export async function readRefs(git: Git): Promise<RefsResult> {

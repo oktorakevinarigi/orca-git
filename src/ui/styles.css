@@ -611,10 +611,6 @@ body.col-resizing * {
   font-weight: 600;
 }
 
-.row.uncommitted {
-  cursor: default;
-}
-
 .row.uncommitted .cell.subject .text {
   font-style: italic;
 }
@@ -936,7 +932,8 @@ body.col-resizing * {
 }
 
 .file.st-A .name,
-.file.st-U .name {
+.file.st-U .name,
+.file.st-\? .name {
   color: var(--file-added);
 }
 
@@ -983,6 +980,30 @@ body.col-resizing * {
 .file.openable .status-letter {
   margin-left: auto;
   flex: none;
+}
+
+/* Opens an uncommitted file in the editor; shown on hover or focus so the list stays calm. */
+.file .open-file {
+  flex: none;
+  height: 18px;
+  min-width: 18px;
+  padding: 0 2px;
+  color: var(--muted-fg);
+  opacity: 0;
+}
+
+.file:hover .open-file,
+.file:focus-within .open-file,
+.file .open-file:focus-visible {
+  opacity: 1;
+}
+
+.file .open-file:hover {
+  color: var(--fg);
+}
+
+.tool[hidden] {
+  display: none;
 }
 
 .status-letter {
@@ -1517,7 +1538,8 @@ textarea.field {
 }
 
 .status-letter.st-A,
-.status-letter.st-U {
+.status-letter.st-U,
+.status-letter.st-\? {
   color: var(--file-added);
 }
 

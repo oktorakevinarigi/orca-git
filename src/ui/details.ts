@@ -17,8 +17,30 @@ export function renderPlaceholder(container: HTMLElement, text: string): void {
   container.replaceChildren(h('div', { class: 'section muted' }, text))
 }
 
-/** The changed files as a foldable folder tree; a click (or Enter) opens `files[index]`'s diff. */
-function filesSection(files: FileChange[], note: string | null, openDiff: (index: number) => void): HTMLElement {
+/** Button opening a work-tree file in the editor; its click never reaches the row (which opens the diff). */
+function openFileButton(path: string, openFile: (path: string) => void): HTMLElement {
+  const stop = (event: Event) => event.stopPropagation()
+  return h(
+    'button',
+    {
+      class: 'tool open-file',
+      title: 'Open file in the editor',
+      'aria-label': `Open ${path} in the editor`,
+      onclick: (event: MouseEvent) => {
+        stop(event)
+        openFile(path)
+      },
+      onkeydown: stop
+    },
+    icon('external')
+  )
+}
+
+/**
+ * The changed files as a foldable folder tree; a click (or Enter) opens `files[index]`'s diff.
+ * With `openFile`, each file that still exists also gets a button opening it in the editor.
+ */
+function filesSection(files: FileChange[], note: string | null, openDiff: (index: number) => void, openFile?: (path: string) => void): HTMLElement {
   const fileRow = (index: number, depth: number) => {
     const f = files[index]
     const letter = f.status[0] ?? 'M'
@@ -39,7 +61,8 @@ function filesSection(files: FileChange[], note: string | null, openDiff: (index
       },
       icon('file'),
       h('span', { class: 'name' }, f.path.slice(f.path.lastIndexOf('/') + 1)),
-      h('span', { class: 'status-letter' }, letter)
+      h('span', { class: 'status-letter' }, letter),
+      openFile && letter !== 'D' ? openFileButton(f.path, openFile) : null
     )
   }
   const folders: { path: string; row: HTMLElement; children: HTMLElement }[] = []
@@ -92,6 +115,26 @@ function filesSection(files: FileChange[], note: string | null, openDiff: (index
     { class: 'section' },
     h('div', { class: 'files-title' }, `${files.length} file${files.length === 1 ? '' : 's'} changed`, note ? h('span', { class: 'muted' }, note) : null, treeTools),
     ...(rows.length ? rows : [h('div', { class: 'muted' }, 'No changes')])
+  )
+}
+
+export interface UncommittedHost {
+  openDiff(files: FileChange[], index: number): void
+  openFile(path: string): void
+}
+
+/** The work tree's changes against HEAD, staged or not, untracked files included. `files` is null while loading. */
+export function renderUncommitted(container: HTMLElement, files: FileChange[] | string | null, host: UncommittedHost): void {
+  container.replaceChildren(
+    Array.isArray(files)
+      ? filesSection(files, null, (index) => host.openDiff(files, index), host.openFile)
+      : h('div', { class: 'section muted' }, files ?? 'Loading the changed files…'),
+    h(
+      'div',
+      { class: 'section uncommitted-details' },
+      h('div', { class: 'subject' }, 'Uncommitted Changes'),
+      h('div', { class: 'meta muted' }, 'Staged and unstaged changes and untracked files, against HEAD. Click a file to see its changes.')
+    )
   )
 }
 

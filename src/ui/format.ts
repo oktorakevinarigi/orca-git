@@ -113,5 +113,12 @@ export const STATUS_NAMES: Record<string, string> = {
   R: 'Renamed',
   C: 'Copied',
   T: 'Type changed',
-  U: 'Unmerged'
+  U: 'Unmerged',
+  '?': 'Untracked'
 }
+
+/** Stands for the work tree where a commit hash is expected (git's null object id), as the worker does. */
+export const WORKTREE = '0'.repeat(40)
+
+/** A commit's short hash, or "Working tree" for the uncommitted changes. */
+export const revisionLabel = (hash: string) => (hash === WORKTREE ? 'Working tree' : shortHash(hash))

@@ -209,7 +209,10 @@ export type PatchResult =
   | { ok: true; name: string; size: number; text?: string; tooLarge?: boolean; path?: string }
   | { ok: false; reason: string; exists?: boolean }
 
-/** What a diff tab shows: `files[index]` of commit `hash`; it can step through the other files. */
+/**
+ * What a diff tab shows: `files[index]` of commit `hash`; it can step through the other files.
+ * A `hash` of forty zeros stands for the uncommitted changes (the work tree against HEAD).
+ */
 export interface DiffTabRequest {
   root: string
   hash: string
@@ -231,6 +234,10 @@ declare module 'orca' {
     'push.check': { input: { root: string; remote?: string; remoteBranch?: string }; output: PushPlan }
     'repo.dirty': { input: { root: string }; output: { files: string[] } }
     'repo.uncommitted': { input: { root: string }; output: { count: number } }
+    /** The work tree against HEAD; untracked files have status `?`. Diff them with the hash `0` × 40. */
+    'repo.uncommittedFiles': { input: { root: string }; output: { files: FileChange[] } }
+    /** Opens a file of the work tree (`path` relative to `root`) in an editor tab. */
+    'file.open': { input: { root: string; path: string; workspaceId?: string }; output: { ok: boolean; reason?: string } }
     'selection.files': { input: { root: string; hashes: string[] }; output: { files: FileChange[] } }
     'action.run': { input: { root: string; action: ActionRequest }; output: ActionResult }
     'tab.open': { input: { workspaceId?: string }; output: { ok: boolean; reason?: string } }

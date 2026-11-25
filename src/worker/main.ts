@@ -4,11 +4,11 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import type { RepoResult } from '../shared/protocol.ts'
 import { checkRewrite, dirtyFiles, runAction } from './actions.ts'
 import { createGit, type Git } from './git.ts'
-import { readDetails, readLogPage, readRefs, readSelectionFiles, readUncommitted } from './log.ts'
+import { readDetails, readLogPage, readRefs, readSelectionFiles, readUncommitted, readUncommittedFiles } from './log.ts'
 import { checkPush } from './push.ts'
 import { focusedWorkspace, resolveRepo, toplevel, type ListedWorkspace, type Workspace } from './repo.ts'
 import { readFileDiff } from './diff.ts'
-import { DIFF_DIR, pickWorkspace, validDiffRequest, writeDiffAnchor } from './difftab.ts'
+import { DIFF_DIR, pickWorkspace, validDiffRequest, workspaceFilePath, writeDiffAnchor } from './difftab.ts'
 import { createPatch } from './patch.ts'
 import { watchRepo, type RepoWatcher } from './watch.ts'
 
@@ -48,6 +48,12 @@ async function exclude(git: Git, root: string, pattern: string): Promise<void> {
   if (current.split(/\r?\n/).includes(pattern)) return
   mkdirSync(dirname(file), { recursive: true })
   appendFileSync(file, `${current && !current.endsWith('\n') ? '\n' : ''}${pattern}\n`)
+}
+
+/** The local workspace holding `root` (the one asked for first), else the focused one. */
+async function workspaceFor(root: string, prefer?: string): Promise<Workspace | { reason: string }> {
+  const { workspaces } = (await orcaApi.host.call('workspace.list', {})) as { workspaces: ListedWorkspace[] }
+  return pickWorkspace(workspaces, root, prefer) ?? focusedWorkspace(orcaApi, prefer)
 }
 
 async function openTab(prefer?: string): Promise<{ ok: boolean; reason?: string }> {
@@ -109,6 +115,8 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   orca.panels.handle('repo.uncommitted', async ({ root }) => ({ count: await readUncommitted(await gitFor(root)) }))
 
+  orca.panels.handle('repo.uncommittedFiles', async ({ root }) => ({ files: await readUncommittedFiles(await gitFor(root)) }))
+
   orca.panels.handle('push.check', async ({ root, remote, remoteBranch }) =>
     checkPush(await gitFor(root), typeof remote === 'string' ? remote : undefined, typeof remoteBranch === 'string' ? remoteBranch : undefined)
   )
@@ -130,16 +138,22 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('diff.openTab', async (input) => {
     const req = validDiffRequest(input)
     const git = await gitFor(req.root)
-    const { workspaces } = (await orca.host.call('workspace.list', {})) as { workspaces: ListedWorkspace[] }
-    let workspace: Workspace | null = pickWorkspace(workspaces, req.root, req.workspaceId)
-    if (!workspace) {
-      const focused = await focusedWorkspace(orca, req.workspaceId)
-      if ('reason' in focused) return { ok: false, reason: focused.reason }
-      workspace = focused
-    }
+    const workspace = await workspaceFor(req.root, req.workspaceId)
+    if ('reason' in workspace) return { ok: false, reason: workspace.reason }
     const path = writeDiffAnchor(workspace.path, req)
     await exclude(git, req.root, `${DIFF_DIR}/`)
     await orca.host.call('editor.open', { workspaceId: workspace.id, path })
+    return { ok: true }
+  })
+
+  orca.panels.handle('file.open', async ({ root, path, workspaceId }) => {
+    await gitFor(root)
+    const workspace = await workspaceFor(root, typeof workspaceId === 'string' ? workspaceId : undefined)
+    if ('reason' in workspace) return { ok: false, reason: workspace.reason }
+    const relative = workspaceFilePath(workspace.path, root, path)
+    if (!relative) return { ok: false, reason: `${path} is not inside the open workspace.` }
+    if (!existsSync(join(workspace.path, relative))) return { ok: false, reason: `${path} no longer exists.` }
+    await orca.host.call('editor.open', { workspaceId: workspace.id, path: relative })
     return { ok: true }
   })
 

@@ -2,12 +2,12 @@ import type { ActionRequest, ActionResult, BranchRef, CommitRow, FileChange, Log
 import { api, copyText, errorMessage, orca } from './api.ts'
 import { renderBranches } from './branches.ts'
 import { addColumnResizers, validColumnWidths, type ColumnWidths } from './columns.ts'
-import { renderDetails, renderMany, renderPlaceholder } from './details.ts'
+import { renderDetails, renderMany, renderPlaceholder, renderUncommitted } from './details.ts'
 import { openDiff, type DiffMode } from './diff.ts'
 import { askDirtyCheckout, askName, askPatch, askPush, askRebasePlan, askReset, busy, confirm, editMessage, pushedWarning } from './dialogs.ts'
 import { append, h, icon } from './dom.ts'
 import { createFilterBar } from './filters.ts'
-import { reachableFrom, refLabels, relativeDate, fullDate, shortHash } from './format.ts'
+import { reachableFrom, refLabels, relativeDate, fullDate, shortHash, WORKTREE } from './format.ts'
 import { computeGraph, graphLanes, graphSvg, ROW_HEIGHT, type GraphRow } from './graph.ts'
 import { showMenu, type MenuEntry } from './menu.ts'
 
@@ -65,6 +65,8 @@ const UNCOMMITTED = '*uncommitted*'
 let uncommitted = 0
 /** The "Uncommitted Changes" row above the commits, when it is shown. */
 let uncommittedGraph: GraphRow | null = null
+/** The "Uncommitted Changes" row is selected (then no commit is). */
+let uncommittedSelected = false
 let reachable = new Set<string>()
 /** First-parent chain from HEAD within the loaded rows, newest first. */
 let mainline: CommitRow[] = []
@@ -270,6 +272,7 @@ function recompute(): void {
   const withUncommitted = uncommitted > 0 && !isFiltered() && !!head && indexByHash.has(head)
   const all = computeGraph(withUncommitted ? [{ hash: UNCOMMITTED, parents: [head!], dashed: true }, ...rows] : rows, isFiltered())
   uncommittedGraph = withUncommitted ? all[0] : null
+  if (!uncommittedGraph) uncommittedSelected = false
   graph = withUncommitted ? all.slice(1) : all
   graphColumnLanes = graphLanes(all)
   reachable = reachableFrom(repo?.head.hash ?? null, rows)
@@ -341,7 +344,7 @@ function pick(choice: WorkspaceChoice): void {
 const rowsOffset = () => (uncommittedGraph ? ROW_HEIGHT : 0)
 const rowTop = (index: number) => rowsOffset() + index * ROW_HEIGHT
 
-/** The work tree's changes, as Git Graph shows them: a dashed node above HEAD. Not selectable. */
+/** The work tree's changes, as Git Graph shows them: a dashed node above HEAD. Selecting it lists the files. */
 function uncommittedElement(row: GraphRow): HTMLElement {
   const subject = h('div', { class: 'cell subject' })
   subject.innerHTML = graphSvg(row, { lanes: graphColumnLanes })
@@ -349,10 +352,12 @@ function uncommittedElement(row: GraphRow): HTMLElement {
   return h(
     'div',
     {
-      class: 'row columns uncommitted',
+      class: `row columns uncommitted${uncommittedSelected ? ' selected' : ''}`,
       style: 'top:0px',
+      dataset: { uncommitted: 'true' },
       role: 'row',
-      title: `${uncommitted} ${uncommitted === 1 ? 'file has' : 'files have'} uncommitted changes`
+      'aria-selected': String(uncommittedSelected),
+      title: `${uncommitted} ${uncommitted === 1 ? 'file has' : 'files have'} uncommitted changes\nClick to see them`
     },
     subject,
     h('div', { class: 'cell author' }, '*'),
@@ -465,7 +470,7 @@ async function reloadLog(keepCount = false): Promise<void> {
   if (selectHead) {
     selectHead = false
     const head = indexByHash.get(repo.head.hash ?? '')
-    if (head !== undefined && !selected.size) {
+    if (head !== undefined && !selected.size && !uncommittedSelected) {
       selected.add(rows[head].hash)
       anchor = head
     }
@@ -522,6 +527,8 @@ function setUncommitted(count: number): void {
   const shift = (uncommittedGraph ? ROW_HEIGHT : 0) - (wasShown ? ROW_HEIGHT : 0)
   if (shift && viewport.scrollTop > 0) viewport.scrollTop += shift
   renderRows()
+  // The selected row went away with the last change: its file list goes too.
+  if (wasShown && !uncommittedGraph && !selected.size) updateDetails()
 }
 
 /** A file of the work tree changed: only the uncommitted changes count is read again. */
@@ -530,7 +537,9 @@ async function refreshUncommitted(): Promise<void> {
   const root = repo.root
   try {
     const { count } = await api.uncommitted(root)
-    if (root === repo?.root) setUncommitted(count)
+    if (root !== repo?.root) return
+    setUncommitted(count)
+    if (uncommittedSelected) updateDetails()
   } catch {
     // The next full refresh (focus, a ref change) reads it again.
   }
@@ -601,6 +610,7 @@ function setRepo(next: RepoInfo): void {
   loadError = null
   if (!same) {
     selected.clear()
+    uncommittedSelected = false
     anchor = cursor = -1
     selectHead = true
     uncommitted = 0
@@ -679,7 +689,7 @@ searchInput.addEventListener('keydown', (event) => {
   } else if (event.key === 'ArrowDown') {
     event.preventDefault()
     viewport.focus()
-    if (!selected.size && rows.length) selectOnly(0)
+    if (!selected.size && !uncommittedSelected && rows.length) selectOnly(0)
   }
 })
 const toggleOption = (button: HTMLElement, key: 'regex' | 'matchCase') => {
@@ -892,6 +902,7 @@ function selectionChanged(): void {
 
 function selectOnly(index: number): void {
   if (index < 0 || index >= rows.length) return
+  uncommittedSelected = false
   selected.clear()
   selected.add(rows[index].hash)
   anchor = cursor = index
@@ -901,11 +912,22 @@ function selectOnly(index: number): void {
 
 function selectRange(to: number, additive: boolean): void {
   if (to < 0 || to >= rows.length) return
+  uncommittedSelected = false
   if (anchor < 0) anchor = to
   if (!additive) selected.clear()
   for (let i = Math.min(anchor, to); i <= Math.max(anchor, to); i++) selected.add(rows[i].hash)
   cursor = to
   ensureVisible(to)
+  selectionChanged()
+}
+
+/** Selects the "Uncommitted Changes" row: the details list the files changed in the work tree. */
+function selectUncommitted(): void {
+  if (!uncommittedGraph) return
+  uncommittedSelected = true
+  selected.clear()
+  anchor = cursor = -1
+  if (viewport.scrollTop > 0) viewport.scrollTop = 0
   selectionChanged()
 }
 
@@ -936,6 +958,11 @@ async function jumpTo(hash: string): Promise<void> {
 viewport.addEventListener('mousedown', (event) => {
   const row = (event.target as HTMLElement).closest<HTMLElement>('.row')
   if (!row) return
+  if (row.dataset.uncommitted) {
+    viewport.focus({ preventScroll: true })
+    if (event.button === 0 || event.button === 2) selectUncommitted()
+    return
+  }
   const index = Number(row.dataset.index)
   const hash = rows[index]?.hash
   if (!hash) return
@@ -947,6 +974,7 @@ viewport.addEventListener('mousedown', (event) => {
   if (event.button !== 0) return
   if (event.shiftKey) selectRange(index, event.ctrlKey || event.metaKey)
   else if (event.ctrlKey || event.metaKey) {
+    uncommittedSelected = false
     if (selected.has(hash)) selected.delete(hash)
     else selected.add(hash)
     anchor = cursor = index
@@ -972,7 +1000,8 @@ viewport.addEventListener('keydown', (event) => {
       move(cursor + 1)
       break
     case 'ArrowUp':
-      move(cursor < 0 ? 0 : cursor - 1)
+      if (!event.shiftKey && cursor <= 0 && uncommittedGraph) selectUncommitted()
+      else move(cursor < 0 ? 0 : cursor - 1)
       break
     case 'PageDown':
       move(cursor + page)
@@ -981,7 +1010,8 @@ viewport.addEventListener('keydown', (event) => {
       move(cursor - page)
       break
     case 'Home':
-      move(0)
+      if (!event.shiftKey && uncommittedGraph) selectUncommitted()
+      else move(0)
       break
     case 'End':
       move(rows.length - 1)
@@ -989,6 +1019,7 @@ viewport.addEventListener('keydown', (event) => {
     case 'a':
     case 'A':
       if (!mod) return
+      uncommittedSelected = false
       rows.forEach((r) => selected.add(r.hash))
       anchor = 0
       cursor = rows.length - 1
@@ -1009,7 +1040,8 @@ viewport.addEventListener('keydown', (event) => {
       break
     }
     case 'Escape':
-      if (!selected.size) return
+      if (!selected.size && !uncommittedSelected) return
+      uncommittedSelected = false
       selected.clear()
       selectionChanged()
       break
@@ -1042,6 +1074,7 @@ async function showDiff(root: string, hash: string, files: FileChange[], index: 
     index,
     mode: prefs.diffMode,
     wholeFile: !prefs.diffChangesOnly,
+    workspaceId: repo?.workspaceId ?? docWorkspaceId,
     onPrefs: (mode, wholeFile) => {
       prefs.diffMode = mode
       prefs.diffChangesOnly = !wholeFile
@@ -1052,9 +1085,41 @@ async function showDiff(root: string, hash: string, files: FileChange[], index: 
 
 let detailsTimer: ReturnType<typeof setTimeout> | undefined
 let detailsToken = 0
+/** Opens a file of the work tree in an editor tab, or says why it cannot. */
+async function openWorktreeFile(root: string, path: string): Promise<void> {
+  try {
+    const result = await api.openFile(root, path, repo?.workspaceId ?? docWorkspaceId)
+    if (!result.ok) showBanner(result.reason ?? `Could not open ${path}.`, 'error')
+  } catch (error) {
+    showBanner(`Could not open ${path}: ${errorMessage(error)}`, 'error')
+  }
+}
+
+/** Lists the uncommitted files; a refresh keeps the current list on screen until the new one arrives. */
+function updateUncommittedDetails(root: string, token: number): void {
+  const host = {
+    openDiff: (files: FileChange[], index: number) => void showDiff(root, WORKTREE, files, index),
+    openFile: (path: string) => void openWorktreeFile(root, path)
+  }
+  if (!detailsPane.querySelector('.uncommitted-details')) renderUncommitted(detailsPane, null, host)
+  detailsTimer = setTimeout(async () => {
+    let files: FileChange[] | string
+    try {
+      files = (await api.uncommittedFiles(root)).files
+    } catch (error) {
+      files = errorMessage(error)
+    }
+    if (token === detailsToken) renderUncommitted(detailsPane, files, host)
+  }, 80)
+}
+
 function updateDetails(): void {
   clearTimeout(detailsTimer)
   if (!prefs.details) return
+  if (repo && uncommittedSelected) {
+    updateUncommittedDetails(repo.root, ++detailsToken)
+    return
+  }
   const hashes = selectedHashes()
   if (!repo || !hashes.length) {
     renderPlaceholder(detailsPane, repo ? 'Select a commit to see its details.' : '')

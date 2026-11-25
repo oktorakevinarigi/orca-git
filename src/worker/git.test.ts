@@ -1,17 +1,17 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { after, test } from 'node:test'
 import { checkRewrite, runAction } from './actions.ts'
 import { createGit } from './git.ts'
-import { countStatusEntries, readDetails, readLogPage, readRefs, readSelectionFiles, readUncommitted } from './log.ts'
+import { readDetails, readLogPage, readRefs, readSelectionFiles, readUncommitted, readUncommittedFiles, WORKTREE } from './log.ts'
 import { isWorktreeRelevant } from './watch.ts'
 import { checkPush } from './push.ts'
 import { readFileDiff } from './diff.ts'
 import { createPatch } from './patch.ts'
-import { diffAnchorName, pickWorkspace, validDiffRequest, writeDiffAnchor } from './difftab.ts'
+import { diffAnchorName, pickWorkspace, validDiffRequest, workspaceFilePath, writeDiffAnchor } from './difftab.ts'
 
 const dirs: string[] = []
 after(() => dirs.forEach((dir) => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })))
@@ -195,8 +195,86 @@ test('uncommitted changes count modified, staged, deleted and untracked files, a
   writeFileSync(join(root, 'new.txt'), 'untracked\n')
   assert.equal(await readUncommitted(git), 5)
   assert.equal((await readRefs(git)).uncommitted, 5)
-  assert.equal(countStatusEntries(''), 0)
-  assert.equal(countStatusEntries('R  new.txt\0old.txt\0 M a.txt\0'), 2)
+})
+
+test('uncommitted files list staged, unstaged, deleted, renamed and every untracked file against HEAD', async () => {
+  const { root } = repo(4)
+  const git = createGit(root)
+  assert.deepEqual(await readUncommittedFiles(git), [])
+  writeFileSync(join(root, 'f1.txt'), 'changed\n')
+  writeFileSync(join(root, 'f2.txt'), 'staged\n')
+  sh(root, 'add', 'f2.txt')
+  sh(root, 'rm', '-q', 'f3.txt')
+  sh(root, 'mv', 'f4.txt', 'moved.txt')
+  mkdirSync(join(root, 'dir'))
+  writeFileSync(join(root, 'dir', 'a.txt'), 'a\n')
+  writeFileSync(join(root, 'dir', 'b.txt'), 'b\n')
+  writeFileSync(join(root, 'ignored.log'), 'x\n')
+  writeFileSync(join(root, '.gitignore'), '*.log\n')
+  assert.deepEqual(await readUncommittedFiles(git), [
+    { status: '?', path: '.gitignore' },
+    { status: '?', path: 'dir/a.txt' },
+    { status: '?', path: 'dir/b.txt' },
+    { status: 'M', path: 'f1.txt' },
+    { status: 'M', path: 'f2.txt' },
+    { status: 'D', path: 'f3.txt' },
+    { status: 'R', path: 'moved.txt', oldPath: 'f4.txt' }
+  ])
+  assert.equal(await readUncommitted(git), 7)
+})
+
+test('uncommitted files before the first commit are measured against the empty tree', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'git-log-test-'))
+  dirs.push(root)
+  sh(root, 'init', '-q')
+  writeFileSync(join(root, 'staged.txt'), 's\n')
+  writeFileSync(join(root, 'loose.txt'), 'l\n')
+  sh(root, 'add', 'staged.txt')
+  const git = createGit(root)
+  assert.deepEqual(await readUncommittedFiles(git), [
+    { status: '?', path: 'loose.txt' },
+    { status: 'A', path: 'staged.txt' }
+  ])
+  assert.deepEqual((await readFileDiff(git, WORKTREE, 'staged.txt')).hunks[0].lines, [{ kind: '+', text: 's', new: 1 }])
+})
+
+test('work-tree diffs show unstaged and staged edits against HEAD and untracked files whole', async () => {
+  const { root } = repo(1)
+  const git = createGit(root)
+  writeFileSync(join(root, 'f1.txt'), 'one\n')
+  sh(root, 'add', 'f1.txt')
+  writeFileSync(join(root, 'f1.txt'), 'one\ntwo\n')
+  const edited = await readFileDiff(git, WORKTREE, 'f1.txt')
+  assert.deepEqual(edited.hunks[0].lines, [
+    { kind: '-', text: '1', old: 1 },
+    { kind: '+', text: 'one', new: 1 },
+    { kind: '+', text: 'two', new: 2 }
+  ])
+  writeFileSync(join(root, 'new file.txt'), 'a\nb\n')
+  const untracked = await readFileDiff(git, WORKTREE, 'new file.txt', undefined, true)
+  assert.equal(untracked.binary, false)
+  assert.deepEqual(untracked.hunks[0].lines, [
+    { kind: '+', text: 'a', new: 1 },
+    { kind: '+', text: 'b', new: 2 }
+  ])
+  writeFileSync(join(root, 'img.bin'), Buffer.from([0, 1, 2, 0, 255]))
+  assert.equal((await readFileDiff(git, WORKTREE, 'img.bin')).binary, true)
+  // A path outside the work tree is never read as an untracked file.
+  writeFileSync(join(root, '..', `${basename(root)}-outside.txt`), 'secret\n')
+  dirs.push(join(root, '..', `${basename(root)}-outside.txt`))
+  await assert.rejects(readFileDiff(git, WORKTREE, `../${basename(root)}-outside.txt`))
+})
+
+test('work-tree files open by their path inside the workspace, never outside the repository', () => {
+  const ws = join(tmpdir(), 'ws')
+  assert.equal(workspaceFilePath(ws, ws, 'src/a.ts'), 'src/a.ts')
+  assert.equal(workspaceFilePath(ws, join(ws, 'sub'), 'a.ts'), 'sub/a.ts')
+  assert.equal(workspaceFilePath(join(ws, 'sub'), ws, 'sub/a.ts'), 'a.ts')
+  assert.equal(workspaceFilePath(join(ws, 'sub'), ws, 'top.ts'), null)
+  assert.equal(workspaceFilePath(ws, ws, '../etc/passwd'), null)
+  assert.equal(workspaceFilePath(ws, ws, join(ws, 'abs.ts')), null)
+  assert.equal(workspaceFilePath(ws, ws, ''), null)
+  assert.equal(workspaceFilePath(ws, ws, '..hidden'), '..hidden')
 })
 
 test('only work-tree paths outside the git dir and the plugin anchors count as changes', () => {
@@ -276,6 +354,7 @@ test('diff tab anchors are named after the file and commit, with the folder when
   const files = [{ status: 'M', path: 'src/ui/index.ts' }, { status: 'A', path: 'src/worker/index.ts' }, { status: 'M', path: 'a:b?.txt' }]
   assert.equal(diffAnchorName(files, 0, '0123456789abcdef'), 'index.ts (ui) @01234567.gitdiff')
   assert.equal(diffAnchorName(files, 2, '0123456789abcdef'), 'a_b_.txt @01234567.gitdiff')
+  assert.equal(diffAnchorName(files, 2, '0'.repeat(40)), 'a_b_.txt (uncommitted).gitdiff')
   const dir = mkdtempSync(join(tmpdir(), 'gitlog-ws-'))
   const workspaces = [
     { id: 'other', name: 'x', path: tmpdir(), branch: null, hostId: null },

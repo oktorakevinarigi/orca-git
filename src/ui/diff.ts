@@ -2,7 +2,7 @@ import type { DiffHunk, DiffLine, FileChange, FileDiff } from '../shared/protoco
 import { api, errorMessage } from './api.ts'
 import { h, icon } from './dom.ts'
 import { changeBlocks, changedRange, splitRows, type RowChange } from './diffmodel.ts'
-import { shortHash, STATUS_NAMES } from './format.ts'
+import { revisionLabel, shortHash, STATUS_NAMES, WORKTREE } from './format.ts'
 import { highlightHunks, segments, type Segment, type Token } from './highlight.ts'
 import { closePopups } from './menu.ts'
 import { createRuler, type RulerMark } from './ruler.ts'
@@ -21,6 +21,8 @@ export interface DiffOptions {
   onPrefs?(mode: DiffMode, wholeFile: boolean): void
   /** Fills the page of its own editor tab: no close button, Escape does nothing. */
   embedded?: boolean
+  /** Workspace to open work-tree files in; the worker picks the one holding `root` otherwise. */
+  workspaceId?: string | null
 }
 
 let closeOpen: (() => void) | null = null
@@ -142,6 +144,8 @@ export function openDiff(options: DiffOptions): void {
   const differences = h('span', { class: 'diff-count' })
   const splitButton = button('split', 'Side-by-side', () => setMode('split'))
   const unifiedButton = button('unified', 'Unified', () => setMode('unified'))
+  const worktree = hash === WORKTREE
+  const openButton = button('external', 'Open file in the editor', () => void openFile())
   const fileBar = h('div', { class: 'diff-files' })
   const view = h(
     'div',
@@ -157,6 +161,7 @@ export function openDiff(options: DiffOptions): void {
       nextFile,
       sep(),
       wholeButton,
+      openButton,
       h('div', { class: 'spacer' }),
       differences,
       h('div', { class: 'segmented', role: 'group', 'aria-label': 'Layout' }, splitButton, unifiedButton),
@@ -182,8 +187,9 @@ export function openDiff(options: DiffOptions): void {
     const file = files[index]
     const letter = file.status[0] ?? 'M'
     const oldPath = file.oldPath ?? file.path
-    const oldRevision = file.base ? shortHash(file.base) : `${shortHash(hash)}^`
-    const newRevision = shortHash(file.tip ?? hash)
+    const oldRevision = file.base ? shortHash(file.base) : worktree ? 'HEAD' : `${shortHash(hash)}^`
+    const newRevision = revisionLabel(file.tip ?? hash)
+    openButton.hidden = !worktree || letter === 'D'
     fileBar.className = `diff-files ${mode}`
     fileBar.replaceChildren(
       ...(mode === 'split'
@@ -191,7 +197,8 @@ export function openDiff(options: DiffOptions): void {
         : [side(`${oldRevision} → ${newRevision}`, oldPath !== file.path ? `${oldPath} → ${file.path}` : file.path, letter)])
     )
     counter.textContent = files.length === 1 ? '1 file' : `${index + 1} of ${files.length} files`
-    if (options.embedded) document.title = `${file.path.slice(file.path.lastIndexOf('/') + 1)} @${shortHash(hash)}`
+    const fileName = file.path.slice(file.path.lastIndexOf('/') + 1)
+    if (options.embedded) document.title = worktree ? `${fileName} (uncommitted)` : `${fileName} @${shortHash(hash)}`
     prevFile.disabled = index === 0
     nextFile.disabled = index === files.length - 1
     splitButton.classList.toggle('on', mode === 'split')
@@ -255,6 +262,18 @@ export function openDiff(options: DiffOptions): void {
     } catch (error) {
       if (mine === token) body.replaceChildren(h('div', { class: 'diff-note error' }, errorMessage(error)))
     }
+  }
+
+  /** Opens the work-tree file in an editor tab; says why in the view when it cannot. */
+  async function openFile(): Promise<void> {
+    let reason: string | undefined
+    try {
+      const result = await api.openFile(root, files[index].path, options.workspaceId)
+      reason = result.ok ? undefined : result.reason ?? 'The file could not be opened.'
+    } catch (error) {
+      reason = errorMessage(error)
+    }
+    if (reason) body.prepend(h('div', { class: 'diff-note error' }, reason))
   }
 
   function go(next: number): void {
