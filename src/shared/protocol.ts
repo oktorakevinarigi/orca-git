@@ -19,7 +19,60 @@ export interface WorkspaceChoice {
   branch: string
 }
 
-export type RepoResult = { ok: true; repo: RepoInfo } | { ok: false; reason: string; choices?: WorkspaceChoice[] }
+/**
+ * How many times the worker has seen the repository change, in this run of the worker (`session`).
+ * A view saved at one stamp is still current while the worker reports the same one.
+ */
+export interface RepoStamp {
+  session: string
+  /** Changes to its refs, HEAD or an operation in progress. */
+  refs: number
+  /** Changes to files of its work tree. */
+  worktree: number
+}
+
+/** The first page of history the panel asks `repo.resolve` to bring back with the lookup. */
+export interface FirstPageRequest {
+  filter: LogFilter
+  limit?: number
+}
+
+/**
+ * What a Git Log view shows, without the commits themselves: a frame may only send small messages,
+ * so the worker keeps the answers it served and hands them back with this (`view.load`).
+ */
+export interface ViewState {
+  repo: RepoInfo
+  /** The repository's change stamp when the shown answers were read; null when unknown. */
+  stamp: RepoStamp | null
+  filter: LogFilter
+  /** Commits shown (loaded so far). */
+  rowCount: number
+  hasMore: boolean
+  uncommitted: number
+  selected: string[]
+  uncommittedSelected: boolean
+  anchor: number
+  cursor: number
+  foldedHash: string | null
+  scrollTop: number
+  /** Height of the commit opened under its row, so the rows below it come back where they were. */
+  expandedHeight: number | null
+}
+
+/** A saved view with the answers it showed, as the worker recorded them. */
+export interface SavedView extends ViewState {
+  rows: CommitRow[]
+  refs: RefsResult | null
+  /** Details of the single selected commit. */
+  details: CommitDetails | null
+  /** The work tree's changed files, when the "Uncommitted Changes" row is selected. */
+  uncommittedFiles: FileChange[] | null
+}
+
+export type RepoResult =
+  | { ok: true; repo: RepoInfo; stamp?: RepoStamp; page?: LogPage }
+  | { ok: false; reason: string; choices?: WorkspaceChoice[] }
 
 export interface BranchRef {
   /** Short name: `main`, `origin/main`, `v1.0`. */
@@ -225,7 +278,12 @@ export interface DiffTabRequest {
 
 declare module 'orca' {
   interface PluginRequests {
-    'repo.resolve': { input: { root?: string; workspaceId?: string }; output: RepoResult }
+    'repo.resolve': { input: { root?: string; workspaceId?: string; page?: FirstPageRequest }; output: RepoResult }
+    /** Keeps what a view shows under `key`, to show it again when its frame is rebuilt. */
+    'view.save': { input: { key: string; state: ViewState }; output: { ok: boolean } }
+    'view.load': { input: { key: string }; output: SavedView | null }
+    /** The repository's change stamp, read without running git. */
+    'repo.stamp': { input: { root: string }; output: RepoStamp }
     'repo.refs': { input: { root: string }; output: RefsResult }
     'repo.watch': { input: { root: string }; output: { ok: boolean } }
     'log.page': { input: { root: string; filter: LogFilter; skip: number; limit?: number }; output: LogPage }
@@ -246,8 +304,8 @@ declare module 'orca' {
     'diff.openTab': { input: DiffTabRequest; output: { ok: boolean; reason?: string } }
   }
   interface PluginPanelEvents {
-    'repo.changed': { root: string }
+    'repo.changed': { root: string; stamp?: RepoStamp }
     /** A file of the work tree changed: only the uncommitted changes count may differ. */
-    'repo.worktree': { root: string }
+    'repo.worktree': { root: string; stamp?: RepoStamp }
   }
 }

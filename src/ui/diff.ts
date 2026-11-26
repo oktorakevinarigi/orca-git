@@ -25,6 +25,19 @@ export interface DiffOptions {
   workspaceId?: string | null
 }
 
+/** Where diff tabs remember their layout; the log reads it to fetch a tab's diff ahead. */
+export const DIFF_TAB_PREFS_KEY = 'git-log.prefs.diff'
+
+/** `changesOnly` (not the older `wholeFile`, saved false by default) so the whole file is the default. */
+export function readDiffTabPrefs(): { mode?: DiffMode; changesOnly?: boolean } {
+  try {
+    const prefs = JSON.parse(localStorage.getItem(DIFF_TAB_PREFS_KEY) ?? '{}')
+    return prefs && typeof prefs === 'object' ? prefs : {}
+  } catch {
+    return {}
+  }
+}
+
 let closeOpen: (() => void) | null = null
 /** Space left above a change scrolled into view, so the line before it shows. */
 const REVEAL_MARGIN = 40

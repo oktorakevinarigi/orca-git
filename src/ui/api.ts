@@ -7,13 +7,17 @@ import type {
   DiffTabRequest,
   FileChange,
   FileDiff,
+  FirstPageRequest,
   LogFilter,
   LogPage,
   PatchResult,
   PushPlan,
   RefsResult,
   RepoResult,
-  RewriteKind
+  RepoStamp,
+  RewriteKind,
+  SavedView,
+  ViewState
 } from '../shared/protocol.ts'
 
 interface Disposable {
@@ -35,8 +39,12 @@ export const orca = (globalThis as unknown as { orca: FrameOrca }).orca
 const LONG = { timeoutMs: 120_000 }
 
 export const api = {
-  resolve: (root?: string, workspaceId?: string | null): Promise<RepoResult> =>
-    orca.plugin.request('repo.resolve', { ...(root ? { root } : {}), ...(workspaceId ? { workspaceId } : {}) }, LONG),
+  /** With `page`, the first page of history comes back with the repository, in the same trip. */
+  resolve: (root?: string, workspaceId?: string | null, page?: FirstPageRequest): Promise<RepoResult> =>
+    orca.plugin.request('repo.resolve', { ...(root ? { root } : {}), ...(workspaceId ? { workspaceId } : {}), ...(page ? { page } : {}) }, LONG),
+  stamp: (root: string): Promise<RepoStamp> => orca.plugin.request('repo.stamp', { root }),
+  saveView: (key: string, state: ViewState): Promise<{ ok: boolean }> => orca.plugin.request('view.save', { key, state }),
+  loadView: (key: string): Promise<SavedView | null> => orca.plugin.request('view.load', { key }),
   refs: (root: string): Promise<RefsResult> => orca.plugin.request('repo.refs', { root }),
   watch: (root: string): Promise<{ ok: boolean }> => orca.plugin.request('repo.watch', { root }),
   page: (root: string, filter: LogFilter, skip: number, limit?: number): Promise<LogPage> =>

@@ -1,15 +1,33 @@
-import type { ActionRequest, ActionResult, BranchRef, CommitDetails, CommitRow, FileChange, LogFilter, RefsResult, RepoInfo, RepoResult, RewriteKind, WorkspaceChoice } from '../shared/protocol.ts'
+import type {
+  ActionRequest,
+  ActionResult,
+  BranchRef,
+  CommitDetails,
+  CommitRow,
+  FileChange,
+  LogFilter,
+  LogPage,
+  RefsResult,
+  RepoInfo,
+  RepoResult,
+  RepoStamp,
+  RewriteKind,
+  SavedView,
+  ViewState,
+  WorkspaceChoice
+} from '../shared/protocol.ts'
 import { api, copyText, errorMessage, orca } from './api.ts'
 import { renderBranches } from './branches.ts'
 import { addColumnResizers, validColumnWidths, type ColumnWidths } from './columns.ts'
 import { commitSummary, renderDetails, renderMany, renderPlaceholder, renderUncommitted } from './details.ts'
-import { openDiff, type DiffMode } from './diff.ts'
+import { openDiff, readDiffTabPrefs, type DiffMode } from './diff.ts'
 import { askDirtyCheckout, askName, askPatch, askPush, askRebasePlan, askReset, busy, confirm, editMessage, pushedWarning } from './dialogs.ts'
 import { append, h, icon } from './dom.ts'
 import { createFilterBar } from './filters.ts'
 import { reachableFrom, refLabels, relativeDate, fullDate, shortHash, WORKTREE } from './format.ts'
 import { computeGraph, graphGapSvg, graphLanes, graphSvg, ROW_HEIGHT, type GraphRow } from './graph.ts'
 import { showMenu, type MenuEntry } from './menu.ts'
+import { MAX_SAVED_SELECTION, viewKey } from './snapshot.ts'
 
 const MODE = document.body.dataset.mode === 'editor' ? 'editor' : 'panel'
 const PREFS_KEY = `git-log.prefs.${MODE}`
@@ -50,7 +68,13 @@ const prefs: Prefs = {
     }
   })()
 }
-const savePrefs = () => localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+const savePrefs = () => {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    // Orca's sandboxed frames may have no storage: the choice lasts while the view is open.
+  }
+}
 
 // ---------- State ----------
 
@@ -73,6 +97,8 @@ let expanded: { hash: string; content: HTMLElement; height: number } | null = nu
 let foldedHash: string | null = null
 /** Scroll the expanded commit into view once its height is known. */
 let revealExpanded = false
+/** The commit opened in a restored view: it opens where it was, without scrolling to it. */
+let restoringHash: string | null = null
 let reachable = new Set<string>()
 /** First-parent chain from HEAD within the loaded rows, newest first. */
 let mainline: CommitRow[] = []
@@ -91,6 +117,17 @@ const selected = new Set<string>()
 let anchor = -1
 let cursor = -1
 const collapsed = new Set(prefs.collapsed)
+/** The repository's change stamp when what is shown was read: a rebuilt view compares it with the worker's. */
+let stamp: RepoStamp | null = null
+/** Details read since the last refresh, by commit: selecting one again shows it at once. */
+const detailsCache = new Map<string, CommitDetails>()
+const MAX_CACHED_DETAILS = 200
+/** The work tree's changed files as last listed; null once they may have changed. */
+let uncommittedFiles: FileChange[] | null = null
+/** Scroll position to restore once the rows are laid out. */
+let pendingScroll: number | null = null
+/** Where this view is saved: set once the editor tab's document is read. */
+let savedViewKey = viewKey(MODE)
 
 const isFiltered = () =>
   Boolean(filter.text?.trim() || filter.users?.length || filter.since || filter.until || filter.paths?.length)
@@ -197,8 +234,22 @@ addColumnResizers(header, {
   }
 })
 
+/** The log's scroll position as last seen on screen: a hidden tab can lose it, so it is put back. */
+let shownScrollTop = 0
+/** The view has no size (its tab is in the background): scroll changes meanwhile are not the person's. */
+let frameHidden = false
+
 new ResizeObserver(() => {
+  if (!app.clientWidth || !app.clientHeight) {
+    frameHidden = true
+    return
+  }
   app.classList.toggle('narrow', app.clientWidth < 640)
+  if (frameHidden) {
+    frameHidden = false
+    // Back from another tab: the log where it was left, the opened commit in place.
+    if (pendingScroll === null) pendingScroll = shownScrollTop
+  }
   renderRows()
 }).observe(app)
 
@@ -384,7 +435,7 @@ function syncExpansion(hash: string | null): void {
     : null
   // A commit further down moves up when the one above it closes: keep it where it was clicked.
   if (was >= 0 && next && indexByHash.get(next)! > was) viewport.scrollTop = Math.max(0, viewport.scrollTop - wasHeight)
-  revealExpanded = Boolean(next)
+  revealExpanded = Boolean(next) && next !== restoringHash
   renderRows()
 }
 
@@ -392,7 +443,7 @@ function syncExpansion(hash: string | null): void {
 function fillExpansion(details: CommitDetails): void {
   if (expanded?.hash !== details.hash) return
   expanded.content.replaceChildren(commitSummary(details, (hash) => void jumpTo(hash)))
-  revealExpanded = true
+  revealExpanded = details.hash !== restoringHash
   renderRows()
 }
 
@@ -489,12 +540,17 @@ function renderRows(): void {
   renderQueued = true
   requestAnimationFrame(() => {
     renderQueued = false
+    const at = expandedIndex()
+    sizer.style.height = `${rowsOffset() + (rows.length + (hasMore ? 1 : 0)) * ROW_HEIGHT + (at >= 0 ? expanded!.height : 0)}px`
+    if (pendingScroll !== null && !frameHidden) {
+      viewport.scrollTop = pendingScroll
+      shownScrollTop = viewport.scrollTop
+      pendingScroll = null
+    }
     const top = viewport.scrollTop
     const height = viewport.clientHeight || 600
-    const at = expandedIndex()
     const first = Math.max(0, rowAt(top) - 10)
     const last = Math.min(rows.length, rowAt(top + height) + 11)
-    sizer.style.height = `${rowsOffset() + (rows.length + (hasMore ? 1 : 0)) * ROW_HEIGHT + (at >= 0 ? expanded!.height : 0)}px`
     const children: HTMLElement[] = []
     if (uncommittedGraph && first === 0) children.push(uncommittedElement(uncommittedGraph))
     for (let i = first; i < last; i++) {
@@ -508,14 +564,23 @@ function renderRows(): void {
     measureExpansion()
     renderEmpty()
     if (hasMore && !loading && !loadError && last >= rows.length - 40) void loadMore()
+    scheduleSave()
   })
 }
 
-viewport.addEventListener('scroll', renderRows, { passive: true })
+viewport.addEventListener(
+  'scroll',
+  () => {
+    if (!frameHidden && !document.hidden && viewport.clientHeight > 0 && pendingScroll === null) shownScrollTop = viewport.scrollTop
+    renderRows()
+  },
+  { passive: true }
+)
 
 // ---------- Loading ----------
 
-async function reloadLog(keepCount = false): Promise<void> {
+/** Reads the first page of the log again, or shows `preloaded` (already read for the current filter). */
+async function reloadLog(keepCount = false, preloaded?: LogPage): Promise<void> {
   if (!repo) return
   const token = ++loadToken
   loading = true
@@ -527,7 +592,7 @@ async function reloadLog(keepCount = false): Promise<void> {
   renderRows()
   const limit = keepCount && rows.length > 300 ? Math.min(rows.length, 2000) : undefined
   try {
-    const page = await api.page(repo.root, filter, 0, limit)
+    const page = preloaded ?? (await api.page(repo.root, filter, 0, limit))
     if (token !== loadToken) return
     rows = page.commits
     hasMore = page.hasMore
@@ -590,6 +655,7 @@ async function loadRefs(): Promise<void> {
   renderTree()
   renderStatus()
   filterBar.update()
+  scheduleSave()
 }
 
 function setUncommitted(count: number): void {
@@ -607,14 +673,18 @@ function setUncommitted(count: number): void {
 }
 
 /** A file of the work tree changed: only the uncommitted changes count is read again. */
-async function refreshUncommitted(): Promise<void> {
+async function refreshUncommitted(next?: RepoStamp): Promise<void> {
   if (!repo) return
   const root = repo.root
   try {
     const { count } = await api.uncommitted(root)
     if (root !== repo?.root) return
+    uncommittedFiles = null
     setUncommitted(count)
     if (uncommittedSelected) updateDetails()
+    // Only the work tree's part: a change of refs still waits for its own refresh.
+    if (next && stamp?.session === next.session) stamp = { ...stamp, worktree: next.worktree }
+    scheduleSave()
   } catch {
     // The next full refresh (focus, a ref change) reads it again.
   }
@@ -661,7 +731,12 @@ async function refreshAll(): Promise<void> {
   if (refreshing) return refreshing
   refreshing = (async () => {
     if (!repo) return start()
-    const result = await api.resolve(repo.root, repo.workspaceId).catch((error) => ({ ok: false as const, reason: errorMessage(error) }))
+    // The first page comes back with the lookup, as many entries as are shown (up to 2000).
+    const asked = filter
+    const limit = rows.length > 300 ? Math.min(rows.length, 2000) : undefined
+    const result = await api
+      .resolve(repo.root, repo.workspaceId, { filter: asked, ...(limit ? { limit } : {}) })
+      .catch((error) => ({ ok: false as const, reason: errorMessage(error) }))
     if (!result.ok) {
       loadError = result.reason
       renderEmpty()
@@ -669,9 +744,12 @@ async function refreshAll(): Promise<void> {
     }
     const wasOperation = repo.operation
     repo = { ...result.repo, workspaceId: repo.workspaceId }
+    stamp = result.stamp ?? null
+    detailsCache.clear()
+    uncommittedFiles = null
     if (repo.operation) showOperationBanner()
     else if (wasOperation) hideBanner()
-    await Promise.all([loadRefs(), reloadLog(true)])
+    await Promise.all([loadRefs(), reloadLog(true, filter === asked ? result.page : undefined)])
   })().finally(() => (refreshing = null))
   return refreshing
 }
@@ -682,10 +760,16 @@ const scheduleRefresh = (delay = 200) => {
   changeTimer = setTimeout(() => void refreshAll(), delay)
 }
 
-function setRepo(next: RepoInfo): void {
+/** Shows the repository `next`; `page` is its first page, read for the current filter. */
+function setRepo(next: RepoInfo, page?: LogPage, nextStamp?: RepoStamp): void {
   const same = repo?.root === next.root
   repo = next
+  stamp = nextStamp ?? null
   loadError = null
+  detailsCache.clear()
+  uncommittedFiles = null
+  // Another repository shows every branch: a page read for some of them does not fit.
+  if (!same && filter.branches?.length) page = undefined
   if (!same) {
     selected.clear()
     uncommittedSelected = false
@@ -700,29 +784,111 @@ function setRepo(next: RepoInfo): void {
   }
   if (next.operation) showOperationBanner()
   void loadRefs()
-  void reloadLog(same)
+  void reloadLog(same, page)
+}
+
+/** The repository an editor tab's document names (and its workspace); none for the side panel. */
+async function documentRoot(): Promise<string | undefined> {
+  if (MODE !== 'editor') return undefined
+  try {
+    const doc = await orca.document!.get()
+    const content = JSON.parse(doc.content.text ?? '{}')
+    docWorkspaceId = typeof content.workspaceId === 'string' ? content.workspaceId : null
+    return typeof content.root === 'string' && content.root ? content.root : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Shows the view as it was saved, without asking git: selection, scroll, details and all. */
+function restoreView(snap: SavedView): void {
+  repo = snap.repo
+  refs = snap.refs
+  stamp = snap.stamp
+  rows = snap.rows
+  hasMore = snap.hasMore
+  filter = snap.filter
+  searchInput.value = filter.text ?? ''
+  uncommitted = snap.uncommitted
+  uncommittedFiles = snap.uncommittedFiles
+  loadError = null
+  choices = []
+  recompute()
+  selected.clear()
+  for (const hash of snap.selected) if (indexByHash.has(hash)) selected.add(hash)
+  uncommittedSelected = snap.uncommittedSelected && Boolean(uncommittedGraph)
+  anchor = snap.anchor < rows.length ? snap.anchor : -1
+  cursor = snap.cursor < rows.length ? snap.cursor : -1
+  foldedHash = snap.foldedHash
+  if (snap.details) detailsCache.set(snap.details.hash, snap.details)
+  pendingScroll = snap.scrollTop
+  shownScrollTop = snap.scrollTop
+  document.title = `Git Log: ${repo.name}`
+  if (repo.operation) showOperationBanner()
+  filterBar.update()
+  renderTree()
+  renderStatus()
+  restoringHash = selected.size === 1 ? [...selected][0] : null
+  updateDetails()
+  // Opened at its saved height, so nothing below it moves while it is measured again.
+  if (expanded && snap.expandedHeight && expanded.hash === restoringHash) expanded.height = snap.expandedHeight
+  renderRows()
+  if (!snap.refs) void loadRefs()
+}
+
+/** After a restore: reads again only what changed since the view was saved (nothing, usually). */
+async function revalidate(): Promise<void> {
+  if (!repo) return
+  const root = repo.root
+  if (!repo.remote) void api.watch(root).catch(() => undefined)
+  let now: RepoStamp
+  try {
+    now = await api.stamp(root)
+  } catch {
+    return void refreshAll()
+  }
+  if (root !== repo?.root) return
+  // Another run of the worker, or refs that moved meanwhile: refreshed in place, the rows stay shown.
+  if (!stamp || now.session !== stamp.session || now.refs !== stamp.refs) return void refreshAll()
+  if (now.worktree !== stamp.worktree) void refreshUncommitted(now)
+}
+
+let restored = false
+
+/** On the view's first start, the saved view of the same repository, if the worker still has it. */
+async function savedView(root: string | undefined): Promise<SavedView | null> {
+  if (restored) return null
+  restored = true
+  // An untitled tab from the + menu follows the focused workspace like the panel, without a saved view.
+  if (MODE === 'editor' && !root) return null
+  const snap = await api.loadView(savedViewKey).catch(() => null)
+  return snap && (!root || snap.repo.root === root) ? snap : null
 }
 
 async function start(): Promise<void> {
-  let root: string | undefined
-  if (MODE === 'editor') {
-    try {
-      const doc = await orca.document!.get()
-      const content = JSON.parse(doc.content.text ?? '{}')
-      root = content.root
-      docWorkspaceId = typeof content.workspaceId === 'string' ? content.workspaceId : null
-    } catch {
-      root = undefined
+  const root = await documentRoot()
+  if (MODE === 'editor') savedViewKey = viewKey(MODE, root)
+  const snap = await savedView(root)
+  if (snap) {
+    restoreView(snap)
+    // A tab names its repository; the panel checks the focused workspace still holds the same one.
+    if (MODE === 'editor') return revalidate()
+    const current = await api.resolve(undefined, docWorkspaceId).catch(() => null)
+    if (current?.ok && current.repo.root === repo?.root) {
+      repo = { ...current.repo }
+      renderStatus()
+      return revalidate()
     }
   }
   try {
-    let result: RepoResult = await api.resolve(root, docWorkspaceId)
+    const asked = filter
+    let result: RepoResult = await api.resolve(root, docWorkspaceId, { filter: asked })
     if (!result.ok && result.choices?.length) {
       const saved = prefs.picked[choiceKey(result.choices)]
-      if (saved && result.choices.some((c) => c.id === saved)) result = await api.resolve(undefined, saved)
+      if (saved && result.choices.some((c) => c.id === saved)) result = await api.resolve(undefined, saved, { filter: asked })
     }
     choices = !result.ok ? (result.choices ?? []) : []
-    if (result.ok) setRepo(result.repo)
+    if (result.ok) setRepo(result.repo, filter === asked ? result.page : undefined, result.stamp)
     else {
       repo = null
       rows = []
@@ -975,6 +1141,7 @@ function ensureVisible(index: number): void {
 }
 
 function selectionChanged(): void {
+  restoringHash = null
   renderRows()
   updateDetails()
 }
@@ -1060,6 +1227,7 @@ viewport.addEventListener('mousedown', (event) => {
     selectionChanged()
   } else if (selected.size === 1 && selected.has(hash) && !uncommittedSelected) {
     foldedHash = expanded?.hash === hash ? hash : null
+    restoringHash = null
     updateDetails()
   } else selectOnly(index)
 })
@@ -1143,6 +1311,10 @@ function copyHashes(): void {
 
 /** Opens the file's changes in their own editor tab; falls back to the in-frame viewer (no workspace, web client). */
 async function showDiff(root: string, hash: string, files: FileChange[], index: number): Promise<void> {
+  // The diff opens in its own tab: the log is saved as it is now, opened commit and all.
+  saveView()
+  // Read while the tab opens: the worker hands the same answer to the tab when it asks.
+  void api.diff(root, hash, files[index], !readDiffTabPrefs().changesOnly).catch(() => undefined)
   try {
     const workspaceId = repo?.workspaceId ?? docWorkspaceId
     const result = await api.openDiffTab({ root, hash, files, index, ...(workspaceId ? { workspaceId } : {}) })
@@ -1170,6 +1342,19 @@ async function showDiff(root: string, hash: string, files: FileChange[], index: 
 
 let detailsTimer: ReturnType<typeof setTimeout> | undefined
 let detailsToken = 0
+/** Waits this long after a selection before reading its details, so arrowing through rows stays light. */
+const DETAILS_DELAY_MS = 40
+
+function cacheDetails(details: CommitDetails): void {
+  detailsCache.delete(details.hash)
+  detailsCache.set(details.hash, details)
+  while (detailsCache.size > MAX_CACHED_DETAILS) detailsCache.delete(detailsCache.keys().next().value!)
+}
+
+function showCommitDetails(root: string, details: CommitDetails): void {
+  fillExpansion(details)
+  if (prefs.details) renderDetails(detailsPane, details, { openDiff: (index) => void showDiff(root, details.hash, details.files, index) })
+}
 /** Opens a file of the work tree in an editor tab, or says why it cannot. */
 async function openWorktreeFile(root: string, path: string): Promise<void> {
   try {
@@ -1186,16 +1371,22 @@ function updateUncommittedDetails(root: string, token: number): void {
     openDiff: (files: FileChange[], index: number) => void showDiff(root, WORKTREE, files, index),
     openFile: (path: string) => void openWorktreeFile(root, path)
   }
+  if (uncommittedFiles) {
+    renderUncommitted(detailsPane, uncommittedFiles, host)
+    return
+  }
   if (!detailsPane.querySelector('.uncommitted-details')) renderUncommitted(detailsPane, null, host)
   detailsTimer = setTimeout(async () => {
     let files: FileChange[] | string
     try {
       files = (await api.uncommittedFiles(root)).files
+      if (token === detailsToken && root === repo?.root) uncommittedFiles = files
     } catch (error) {
       files = errorMessage(error)
     }
     if (token === detailsToken) renderUncommitted(detailsPane, files, host)
-  }, 80)
+    scheduleSave()
+  }, DETAILS_DELAY_MS)
 }
 
 function updateDetails(): void {
@@ -1231,15 +1422,21 @@ function updateDetails(): void {
         files = errorMessage(error)
       }
       if (token === detailsToken) renderMany(detailsPane, commits, files, host)
-    }, 150)
+    }, DETAILS_DELAY_MS * 2)
+    return
+  }
+  const cached = detailsCache.get(hashes[0])
+  if (cached) {
+    showCommitDetails(root, cached)
     return
   }
   detailsTimer = setTimeout(async () => {
     try {
       const details = await api.details(root, hashes[0])
+      if (root === repo?.root) cacheDetails(details)
       if (token !== detailsToken) return
-      fillExpansion(details)
-      if (prefs.details) renderDetails(detailsPane, details, { openDiff: (index) => void showDiff(root, details.hash, details.files, index) })
+      showCommitDetails(root, details)
+      scheduleSave()
     } catch (error) {
       if (token !== detailsToken) return
       if (prefs.details) renderPlaceholder(detailsPane, errorMessage(error))
@@ -1520,8 +1717,8 @@ orca.plugin.on('repo.changed', ({ root }: { root: string }) => {
   if (root === repo?.root) scheduleRefresh()
 })
 
-orca.plugin.on('repo.worktree', ({ root }: { root: string }) => {
-  if (root === repo?.root) void refreshUncommitted()
+orca.plugin.on('repo.worktree', ({ root, stamp: next }: { root: string; stamp?: RepoStamp }) => {
+  if (root === repo?.root) void refreshUncommitted(next)
 })
 
 if (MODE === 'panel') {
@@ -1536,11 +1733,58 @@ if (MODE === 'panel') {
   })
 }
 
+// A local repository is watched: its view refreshes when it changes, not when it gets focus again.
+// One on another host cannot be watched, so it still reads its refs again on focus, in place.
 let lastFocusRefresh = 0
 addEventListener('focus', () => {
-  if (Date.now() - lastFocusRefresh < 3000) return
+  if (!repo?.remote || Date.now() - lastFocusRefresh < 3000) return
   lastFocusRefresh = Date.now()
-  if (repo) scheduleRefresh(50)
+  scheduleRefresh(50)
+})
+
+// ---------- Saved view ----------
+
+let saveTimer: ReturnType<typeof setTimeout> | undefined
+const SAVE_DELAY_MS = 400
+
+function scheduleSave(): void {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(saveView, SAVE_DELAY_MS)
+}
+
+/** The last view sent, so an unchanged one is not sent again. */
+let lastSaved = ''
+
+/** Sends what is shown to the worker, once it is fully loaded, so a rebuilt view shows it again at once. */
+function saveView(): void {
+  clearTimeout(saveTimer)
+  if (!repo || loading || loadError || !rows.length) return
+  const state: ViewState = {
+    repo,
+    stamp,
+    filter,
+    rowCount: rows.length,
+    hasMore,
+    uncommitted,
+    selected: selected.size <= MAX_SAVED_SELECTION ? [...selected] : [],
+    uncommittedSelected,
+    anchor,
+    cursor,
+    foldedHash,
+    scrollTop: pendingScroll ?? shownScrollTop,
+    expandedHeight: expanded?.height ?? null
+  }
+  const text = JSON.stringify([savedViewKey, state])
+  if (text === lastSaved) return
+  lastSaved = text
+  void api.saveView(savedViewKey, state).catch(() => {
+    lastSaved = ''
+  })
+}
+
+addEventListener('pagehide', saveView)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveView()
 })
 
 applyLayout()

@@ -1,10 +1,12 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
-import type { DiffTabRequest, RepoResult } from '../shared/protocol.ts'
+import { randomUUID } from 'node:crypto'
+import type { DiffTabRequest, FileDiff, LogFilter, LogPage, RepoResult, RepoStamp } from '../shared/protocol.ts'
 import { checkRewrite, dirtyFiles, runAction } from './actions.ts'
+import { createMemo } from './cache.ts'
 import { createGit, lastLines, type Git } from './git.ts'
-import { readDetails, readLogPage, readRefs, readSelectionFiles, readUncommitted, readUncommittedFiles } from './log.ts'
+import { readDetails, readLogPage, readRefs, readSelectionFiles, readUncommitted, readUncommittedFiles, WORKTREE } from './log.ts'
 import { checkPush } from './push.ts'
 import { closeRemoteShells, focusedWorkspace, remoteShell, remoteWorkspaceFor, resolveRepo, toplevel, type ListedWorkspace, type Workspace } from './repo.ts'
 import { createOrcaCli, findOrcaCli } from './orcacli.ts'
@@ -12,6 +14,7 @@ import { readFileDiff } from './diff.ts'
 import { DIFF_DIR, pickWorkspace, remoteDiffAnchor, remoteExcludeScript, remoteWriteScript, validDiffRequest, workspaceFilePath, writeDiffAnchor } from './difftab.ts'
 import { shellQuote } from './remote.ts'
 import { createPatch } from './patch.ts'
+import { createViewStore } from './views.ts'
 import { watchRepo, type RepoWatcher } from './watch.ts'
 import { firstViewCalls } from './warmup.ts'
 
@@ -29,6 +32,24 @@ export const REMOTE_READ_ONLY = 'This project is on a remote host: Git Log can s
 let orcaApi: OrcaWorkerApi
 const repos = new Map<string, Git>()
 const watchers = new Map<string, Promise<RepoWatcher | null>>()
+
+/** This run of the worker: change counts start over when it restarts. */
+const SESSION = randomUUID()
+/** Changes seen per repository root, so a reopened view knows whether it is still current. */
+const changes = new Map<string, { refs: number; worktree: number }>()
+const stampOf = (root: string): RepoStamp => ({ session: SESSION, refs: 0, worktree: 0, ...changes.get(root) })
+
+/** A commit's diff never changes: the latest few are kept, and asked again (a prefetch, then the tab) only once. */
+const commitDiffs = createMemo<FileDiff>(40)
+/** Uncommitted changes do: kept just long enough for the diff tab to take what was fetched ahead for it. */
+const WORKTREE_DIFF_MS = 3000
+const worktreeDiffs = createMemo<FileDiff>(20, WORKTREE_DIFF_MS)
+
+/** What each open view shows, and the answers it was served, for a frame Orca rebuilds. */
+const views = createViewStore()
+
+/** Repositories whose info/exclude already lists a pattern, as `root\0pattern`. */
+const excluded = new Set<string>()
 
 async function setting<T>(key: string, fallback: T): Promise<T> {
   try {
@@ -70,11 +91,15 @@ async function gitFor(root: unknown): Promise<Git> {
 
 /** Adds `pattern` to the repository's info/exclude so the anchor never shows as untracked. */
 async function exclude(git: Git, root: string, pattern: string): Promise<void> {
+  const key = `${root}\0${pattern}`
+  if (excluded.has(key)) return
   const file = resolve(root, (await git.out(['rev-parse', '--git-path', 'info/exclude'])).trim())
   const current = existsSync(file) ? readFileSync(file, 'utf8') : ''
-  if (current.split(/\r?\n/).includes(pattern)) return
-  mkdirSync(dirname(file), { recursive: true })
-  appendFileSync(file, `${current && !current.endsWith('\n') ? '\n' : ''}${pattern}\n`)
+  if (!current.split(/\r?\n/).includes(pattern)) {
+    mkdirSync(dirname(file), { recursive: true })
+    appendFileSync(file, `${current && !current.endsWith('\n') ? '\n' : ''}${pattern}\n`)
+  }
+  excluded.add(key)
 }
 
 /** The local workspace holding `root` (the one asked for first), else the focused one. */
@@ -143,10 +168,13 @@ async function openRemoteTab(workspace: Workspace): Promise<Opened> {
 /** Adds the tab files' pattern to the repository's info/exclude, on this computer or on its remote host. */
 async function keepTabFilesOut(git: Git, root: string): Promise<void> {
   if (!git.remote) return exclude(git, root, TAB_FILES)
+  const key = `${root}\0${TAB_FILES}`
+  if (excluded.has(key)) return
   const workspace = await remoteWorkspaceFor(orcaApi, root)
   if (!workspace) return
   const result = await (await remoteShell(orcaApi, workspace)).run({ kind: 'sh', cwd: root, script: remoteExcludeScript(TAB_FILES) })
   if (!result.ok) throw new Error(lastLines(result.stderr) || 'git rev-parse failed')
+  excluded.add(key)
 }
 
 async function openTab(prefer?: string): Promise<Opened> {
@@ -169,18 +197,44 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   orca.panels.handle('repo.resolve', async (input, context): Promise<RepoResult> => {
     // On a remote host the first view's answers are fetched along with the lookup.
-    const size = await pageSize()
-    const result = await resolveRepo(orca, await gitPath(), input?.root, input?.workspaceId, (root) => firstViewCalls(root, size))
+    const [size, path] = await Promise.all([pageSize(), gitPath()])
+    const wanted = firstPageRequest(input?.page)
+    const isTab = context?.panel?.contributionId === LOG_TAB
+    let stamp: RepoStamp | undefined
+    let page: Promise<LogPage | undefined> | undefined
+    let tabFiles: Promise<void> | undefined
+    // Started alongside the reads of HEAD and any operation in progress: one trip for the panel.
+    const onRoot = (git: Git, root: string) => {
+      stamp = stampOf(root)
+      if (wanted) {
+        page = (wanted.limit ? pageSize(wanted.limit) : Promise.resolve(size)).then((limit) => readLogPage(git, wanted.filter, 0, limit)).catch(() => undefined)
+      }
+      // A Git Log tab, maybe an untitled one from the + menu: its file stays out of `git status`.
+      if (isTab) tabFiles = keepTabFilesOut(git, root).catch((error) => orca.log(`exclude ${TAB_FILES}: ${error instanceof Error ? error.message : String(error)}`))
+    }
+    const result = await resolveRepo(orca, path, input?.root, input?.workspaceId, (root) => firstViewCalls(root, size), onRoot)
+    await tabFiles
     if (!result.ok) return result
     if (result.git) repos.set(result.repo.root, result.git)
-    // A Git Log tab, maybe an untitled one from the + menu: its file stays out of `git status`.
-    if (result.git && context?.panel?.contributionId === LOG_TAB) {
-      await keepTabFilesOut(result.git, result.repo.root).catch((error) => orca.log(`exclude ${TAB_FILES}: ${error instanceof Error ? error.message : String(error)}`))
-    }
-    return { ok: true, repo: result.repo }
+    const first = page ? await page : undefined
+    if (first && wanted) views.recordPage(result.repo.root, wanted.filter, 0, first)
+    return { ok: true, repo: result.repo, ...(stamp ? { stamp } : {}), ...(first ? { page: first } : {}) }
   })
 
-  orca.panels.handle('repo.refs', async ({ root }) => readRefs(await gitFor(root)))
+  orca.panels.handle('repo.stamp', async ({ root }) => {
+    if (typeof root !== 'string' || !root) throw new Error('Missing repository.')
+    return stampOf(root)
+  })
+
+  orca.panels.handle('repo.refs', async ({ root }) => {
+    const refs = await readRefs(await gitFor(root))
+    views.recordRefs(root, refs)
+    return refs
+  })
+
+  orca.panels.handle('view.save', async ({ key, state }) => ({ ok: views.save(key, state) }))
+
+  orca.panels.handle('view.load', async ({ key }) => views.load(key))
 
   orca.panels.handle('repo.watch', async ({ root }) => {
     const git = await gitFor(root)
@@ -192,9 +246,9 @@ export default function activate(orca: OrcaWorkerApi): void {
         watchRepo(
           git,
           root,
-          () => orca.panels.post('repo.changed', { root }),
+          () => changed(root),
           undefined,
-          () => orca.panels.post('repo.worktree', { root })
+          () => worktreeChanged(root)
         ).catch(() => null)
       )
     }
@@ -203,14 +257,25 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   orca.panels.handle('log.page', async ({ root, filter, skip, limit }) => {
     const size = await pageSize(limit)
-    return readLogPage(await gitFor(root), filter ?? {}, Math.max(0, Math.floor(Number(skip) || 0)), size)
+    const from = Math.max(0, Math.floor(Number(skip) || 0))
+    const page = await readLogPage(await gitFor(root), filter ?? {}, from, size)
+    views.recordPage(root, filter, from, page)
+    return page
   })
 
-  orca.panels.handle('commit.details', async ({ root, hash }) => readDetails(await gitFor(root), hash))
+  orca.panels.handle('commit.details', async ({ root, hash }) => {
+    const details = await readDetails(await gitFor(root), hash)
+    views.recordDetails(root, details)
+    return details
+  })
 
-  orca.panels.handle('file.diff', async ({ root, hash, path, oldPath, base, tip, wholeFile }) =>
-    readFileDiff(await gitFor(root), hash, path, oldPath, Boolean(wholeFile), base || tip ? { base: String(base), tip: String(tip) } : undefined)
-  )
+  orca.panels.handle('file.diff', async ({ root, hash, path, oldPath, base, tip, wholeFile }) => {
+    const git = await gitFor(root)
+    const range = base || tip ? { base: String(base), tip: String(tip) } : undefined
+    const key = JSON.stringify([root, hash, path, oldPath ?? '', range?.base ?? '', range?.tip ?? '', Boolean(wholeFile)])
+    const memo = hash === WORKTREE ? worktreeDiffs : commitDiffs
+    return memo.get(key, () => readFileDiff(git, hash, path, oldPath, Boolean(wholeFile), range))
+  })
 
   orca.panels.handle('selection.files', async ({ root, hashes }) => ({ files: await readSelectionFiles(await gitFor(root), hashes) }))
 
@@ -218,7 +283,11 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   orca.panels.handle('repo.uncommitted', async ({ root }) => ({ count: await readUncommitted(await gitFor(root)) }))
 
-  orca.panels.handle('repo.uncommittedFiles', async ({ root }) => ({ files: await readUncommittedFiles(await gitFor(root)) }))
+  orca.panels.handle('repo.uncommittedFiles', async ({ root }) => {
+    const files = await readUncommittedFiles(await gitFor(root))
+    views.recordUncommittedFiles(root, files)
+    return { files }
+  })
 
   orca.panels.handle('push.check', async ({ root, remote, remoteBranch }) => {
     const git = await gitFor(root)
@@ -242,7 +311,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     const git = await gitFor(root)
     if (git.remote) return { ok: false, message: REMOTE_READ_ONLY }
     const result = await runAction(git, action)
-    orca.panels.post('repo.changed', { root })
+    changed(root)
     return result
   })
 
@@ -280,9 +349,40 @@ export default function activate(orca: OrcaWorkerApi): void {
   })
 }
 
+/** The repository's refs or HEAD changed: every open view of it refreshes. */
+function changed(root: string): void {
+  const { refs, worktree } = stampOf(root)
+  changes.set(root, { refs: refs + 1, worktree })
+  worktreeDiffs.clear()
+  views.forgetDetails(root)
+  orcaApi.panels.post('repo.changed', { root, stamp: stampOf(root) })
+}
+
+/** A file of its work tree changed: only its uncommitted changes need reading again. */
+function worktreeChanged(root: string): void {
+  const { refs, worktree } = stampOf(root)
+  changes.set(root, { refs, worktree: worktree + 1 })
+  worktreeDiffs.clear()
+  views.forgetUncommitted(root)
+  orcaApi.panels.post('repo.worktree', { root, stamp: stampOf(root) })
+}
+
+/** The first page `repo.resolve` is asked to bring back, when the request names a valid one. */
+function firstPageRequest(input: unknown): { filter: LogFilter; limit?: number } | null {
+  if (!input || typeof input !== 'object') return null
+  const { filter, limit } = input as { filter?: unknown; limit?: unknown }
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) return null
+  return { filter: filter as LogFilter, ...(typeof limit === 'number' && limit > 0 ? { limit } : {}) }
+}
+
 export async function deactivate(): Promise<void> {
   for (const watcher of watchers.values()) void watcher.then((w) => w?.close())
   watchers.clear()
   repos.clear()
+  changes.clear()
+  excluded.clear()
+  commitDiffs.clear()
+  worktreeDiffs.clear()
+  views.clear()
   await closeRemoteShells()
 }

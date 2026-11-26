@@ -65,6 +65,8 @@ a details pane with file diffs, and a right-click menu to rewrite history on a m
 - **Undo** banner after each rewrite (resets back to the previous HEAD with `--keep`).
 - Commits already pushed to a remote branch trigger a warning before they are rewritten.
 - Live refresh when the repository changes (commits, checkouts, fetches, rebases from a terminal).
+  Switching tabs keeps the log as it was (graph, selection, scroll and details), without loading it
+  again; it is read again only when the repository changed or on Refresh / Fetch.
 
 ## Where it shows
 

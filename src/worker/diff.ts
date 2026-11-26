@@ -1,4 +1,5 @@
 import type { DiffHunk, FileDiff } from '../shared/protocol.ts'
+import { createMemo } from './cache.ts'
 import { lastLines, type Git } from './git.ts'
 import { readUntracked, worktreeBase, WORKTREE } from './log.ts'
 
@@ -48,6 +49,11 @@ const literal = (path: string) => `:(literal)${path}`
 
 const HASH = /^[0-9a-f]{40}$/
 
+/** A commit's parents never change: each is read from git once. */
+const parentsOf = createMemo<string[]>(5000)
+const readParents = (git: Git, hash: string) =>
+  parentsOf.get(hash, async () => (await git.out(['rev-list', '--parents', '-n1', hash, '--'])).trim().split(' ').slice(1))
+
 /**
  * The changes `hash` made to `path` (renamed from `oldPath`), against its first parent;
  * or, given `range`, the changes from `range.base` to `range.tip` (a multi-commit selection).
@@ -64,7 +70,7 @@ export async function readFileDiff(
   if (!path || typeof path !== 'string') throw new Error('Missing file path.')
   if (hash === WORKTREE) return readWorktreeDiff(git, path, oldPath, wholeFile)
   if (range && !(HASH.test(range.base) && HASH.test(range.tip))) throw new Error('Invalid commit range.')
-  const parents = range ? [range.base] : (await git.out(['rev-list', '--parents', '-n1', hash, '--'])).trim().split(' ').slice(1)
+  const parents = range ? [range.base] : await readParents(git, hash)
   const to = range ? range.tip : hash
   const paths = [...(oldPath && oldPath !== path ? [literal(oldPath)] : []), literal(path)]
   const options = ['--no-ext-diff', '--no-textconv', '-M', `-U${wholeFile ? 1_000_000 : 3}`]

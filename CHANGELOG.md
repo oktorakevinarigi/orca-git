@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.0 — 2026-11-26
+
+Switching away from a Git Log tab and back no longer loads the log again: the tab shows the graph,
+the selection, the scroll position, the opened commit and its details exactly as you left them, even
+when Orca rebuilt the tab or you opened a changed file in its own tab meanwhile (a commit opened under
+its row comes back open, at its place, without the log scrolling to it). Orca runs plugin views in
+sandboxed frames that have no storage and may only send small messages, so the view is kept by the
+plugin's worker, which hands back the commits, refs and details it served; the log reads git again
+only when the repository changed meanwhile (a commit, checkout or fetch from a terminal still
+refreshes it, in place, without a loading screen) or when you press Refresh or Fetch. The log no longer refreshes merely because it gets focus (a project on a
+remote host, which cannot be watched, still does). The graph also appears sooner: the first page of
+history now comes back with the repository lookup in one request instead of two, a folder's
+repository and git's own file locations are looked up once, and the tab keeps its file out of
+`git status` alongside the lookup instead of after it. A file's changes open faster too: the diff is
+read while its tab is still opening, a commit's diff and parents are read from git only once
+(opening the same file again is instant), a commit's details show at once when you select it again,
+and the wait before reading the details of a selection is halved.
+
 ## 0.9.1 — 2026-11-26
 
 When Git Log opens, the selected HEAD entry no longer opens its details under its row by itself: the

@@ -59,7 +59,11 @@ test('resolves the focused workspace, pages the log and opens the editor tab', a
     const run = await worker.request('action.run', { root, action: { kind: 'drop', hashes: [middle.hash] } })
     assert.equal(run.ok, true, run.message)
     assert.equal(run.previousHead, newest.hash)
-    assert.deepEqual(worker.posts.at(-1), { event: 'repo.changed', payload: { root } })
+    const posted = worker.posts.at(-1) as { event: string; payload: { root: string; stamp: { session: string; refs: number } } }
+    assert.equal(posted.event, 'repo.changed')
+    assert.equal(posted.payload.root, root)
+    assert.equal(posted.payload.stamp.refs, 1, 'the change is counted')
+    assert.deepEqual(await worker.request('repo.stamp', { root }), posted.payload.stamp)
 
     // The tab's file reads as "Git Log"; an earlier version's file goes, every *.gitlog stays out of git status.
     writeFileSync(join(root, '.orca-git-log.gitlog'), '{}')
@@ -73,6 +77,64 @@ test('resolves the focused workspace, pages the log and opens the editor tab', a
 
     await assert.rejects(worker.request('log.page', { root: tmpdir(), filter: {}, skip: 0 }))
     assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+  } finally {
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+test('the lookup brings back the first page and the change stamp; diffs are read once', async () => {
+  const root = fixture()
+  try {
+    const worker = await mountWorker(main, { host: host(root) })
+    const resolved = await worker.request('repo.resolve', { page: { filter: {}, limit: 2 } })
+    assert.equal(resolved.ok, true)
+    if (!resolved.ok) return
+    assert.deepEqual(resolved.page?.commits.map((c: { subject: string }) => c.subject), ['three', 'two'])
+    assert.equal(resolved.page?.hasMore, true)
+    assert.deepEqual(resolved.stamp && { refs: resolved.stamp.refs, worktree: resolved.stamp.worktree }, { refs: 0, worktree: 0 })
+    assert.deepEqual(await worker.request('repo.stamp', { root }), resolved.stamp)
+
+    const filtered = await worker.request('repo.resolve', { root, page: { filter: { text: 'one' } } })
+    assert.deepEqual(filtered.ok && filtered.page?.commits.map((c: { subject: string }) => c.subject), ['one'])
+    const plain = await worker.request('repo.resolve', { root, page: 'nonsense' as never })
+    assert.equal(plain.ok && plain.page, undefined, 'an invalid page request is ignored')
+
+    // A view sends only what it shows; it comes back with the commits it was served.
+    const more = await worker.request('log.page', { root, filter: {}, skip: 2, limit: 2 })
+    assert.deepEqual(more.commits.map((c: { subject: string }) => c.subject), ['one'])
+    const view = {
+      repo: resolved.repo,
+      stamp: resolved.stamp ?? null,
+      filter: {},
+      rowCount: 3,
+      hasMore: false,
+      uncommitted: 0,
+      selected: [more.commits[0].hash],
+      uncommittedSelected: false,
+      anchor: 2,
+      cursor: 2,
+      foldedHash: null,
+      scrollTop: 30,
+      expandedHeight: 80
+    }
+    assert.deepEqual(await worker.request('view.save', { key: `editor:${root}`, state: view }), { ok: true })
+    const back = await worker.request('view.load', { key: `editor:${root}` })
+    assert.deepEqual(back?.rows.map((c: { subject: string }) => c.subject), ['three', 'two', 'one'])
+    assert.equal(back?.expandedHeight, 80)
+
+    // A commit's diff is read once: a rewritten file on disk does not change it.
+    const newest = resolved.page!.commits[0]
+    const ask = { root, hash: newest.hash, path: 'three.txt', wholeFile: true }
+    const [first, second] = await Promise.all([worker.request('file.diff', ask), worker.request('file.diff', ask)])
+    assert.deepEqual(first, second)
+    assert.deepEqual(first.hunks[0].lines, [{ kind: '+', text: 'three', new: 1 }])
+
+    // Uncommitted diffs change with the work tree: a change seen by the watcher reads them again.
+    writeFileSync(join(root, 'one.txt'), 'uno')
+    const worktreeAsk = { root, hash: '0'.repeat(40), path: 'one.txt' }
+    const before = await worker.request('file.diff', worktreeAsk)
+    assert.ok(before.hunks[0].lines.some((l: { kind: string; text: string }) => l.kind === '+' && l.text === 'uno'))
     await worker.deactivate()
   } finally {
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })

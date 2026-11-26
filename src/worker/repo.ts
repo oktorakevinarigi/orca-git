@@ -11,6 +11,9 @@ import { createRemoteGit, RemoteShell, type RemoteCall, type TerminalHost } from
 /** Calls to fetch ahead, with the repository lookup, for the first view of the repository at `root`. */
 export type WarmUp = (root: string) => RemoteCall[]
 
+/** Called as soon as the repository's root is known, before its HEAD is read: work to start alongside. */
+export type OnRoot = (git: Git, root: string) => void
+
 export interface Workspace {
   /** Its id in Orca's window (what `editor.open` takes). */
   id: string
@@ -197,7 +200,13 @@ export async function closeRemoteShells(): Promise<void> {
 }
 
 /** The repository holding `folder` (the workspace's own by default) on its host, checked by git there. */
-async function resolveRemote(orca: OrcaWorkerApi, workspace: Workspace, folder = workspace.path, warm?: WarmUp): Promise<RepoResult & { git?: Git }> {
+async function resolveRemote(
+  orca: OrcaWorkerApi,
+  workspace: Workspace,
+  folder = workspace.path,
+  warm?: WarmUp,
+  onRoot?: OnRoot
+): Promise<RepoResult & { git?: Git }> {
   let top
   let shell: RemoteShell
   try {
@@ -212,12 +221,23 @@ async function resolveRemote(orca: OrcaWorkerApi, workspace: Workspace, folder =
   if (!top.ok || !root) return { ok: false, reason: `${basename(folder)} is not a Git repository.` }
   remoteRoots.set(root, workspace)
   const git = createRemoteGit(shell, root)
+  onRoot?.(git, root)
   return { ok: true, repo: { ...(await describeRepo(git, root, workspace.id)), remote: true }, git }
 }
 
+/** Top-level folders found so far, by git binary and folder: a folder stays in the same repository. */
+const toplevels = new Map<string, string>()
+
 export async function toplevel(path: string, gitPath: string): Promise<string | null> {
+  const key = `${gitPath}\0${path}`
+  const known = toplevels.get(key)
+  // Checked again when the repository's folder is gone.
+  if (known && existsSync(known)) return known
   const result = await createGit(path, gitPath).run(['rev-parse', '--show-toplevel'])
-  return result.ok ? resolve(result.stdout.trim()) : null
+  const root = result.ok ? resolve(result.stdout.trim()) : null
+  if (root) toplevels.set(key, root)
+  else toplevels.delete(key)
+  return root
 }
 
 export async function describeRepo(git: Git, root: string, workspaceId: string | null): Promise<RepoInfo> {
@@ -230,7 +250,8 @@ export async function resolveRepo(
   gitPath: string,
   requested?: string,
   prefer?: string,
-  warm?: WarmUp
+  warm?: WarmUp,
+  onRoot?: OnRoot
 ): Promise<RepoResult & { git?: Git }> {
   let path: string
   let workspaceId: string | null = null
@@ -240,18 +261,19 @@ export async function resolveRepo(
       // Not on this computer: a repository in a workspace on another host.
       const remote = await remoteWorkspaceFor(orca, requested, prefer)
       if (!remote) return { ok: false, reason: `${requested} no longer exists.` }
-      return resolveRemote(orca, remote, requested, warm)
+      return resolveRemote(orca, remote, requested, warm, onRoot)
     }
     path = requested
   } else {
     const workspace = await focusedWorkspace(orca, prefer)
     if ('reason' in workspace) return { ok: false, ...workspace }
-    if (workspace.remote) return resolveRemote(orca, workspace, workspace.path, warm)
+    if (workspace.remote) return resolveRemote(orca, workspace, workspace.path, warm, onRoot)
     path = workspace.path
     workspaceId = workspace.id
   }
   const root = await toplevel(path, gitPath)
   if (!root) return { ok: false, reason: `${basename(path)} is not a Git repository.` }
   const git = createGit(root, gitPath)
+  onRoot?.(git, root)
   return { ok: true, repo: await describeRepo(git, root, workspaceId), git }
 }

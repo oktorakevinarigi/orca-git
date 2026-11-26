@@ -58,6 +58,21 @@ export function createGit(root: string, gitPath = 'git'): Git {
         }
       )
     })
+  // Where git keeps its own files does not move: asked once per set of names, then checked on disk.
+  const gitPaths = new Map<string, Promise<string[] | null>>()
+  const locate = (names: string[]) => {
+    const key = names.join('\0')
+    let found = gitPaths.get(key)
+    if (!found) {
+      found = run(['rev-parse', '--path-format=absolute', ...names.flatMap((name) => ['--git-path', name])]).then((result) =>
+        result.ok ? result.stdout.split(/\r?\n/).map((path) => path.trim()) : null
+      )
+      gitPaths.set(key, found)
+      // A failed lookup (a repository being created) is asked again next time.
+      void found.then((paths) => paths ?? gitPaths.delete(key))
+    }
+    return found
+  }
   return {
     run,
     async out(args, options) {
@@ -67,8 +82,7 @@ export function createGit(root: string, gitPath = 'git'): Git {
     },
     async gitPathsExist(names) {
       if (!names.length) return []
-      const result = await run(['rev-parse', '--path-format=absolute', ...names.flatMap((name) => ['--git-path', name])])
-      const paths = result.ok ? result.stdout.split(/\r?\n/).map((path) => path.trim()) : []
+      const paths = (await locate(names)) ?? []
       return names.map((_, i) => Boolean(paths[i]) && existsSync(paths[i]))
     }
   }

@@ -1,10 +1,8 @@
 // Entry of a diff editor tab: its document names the commit and files to show.
 import type { DiffTabRequest } from '../shared/protocol.ts'
 import { errorMessage, orca } from './api.ts'
-import { openDiff, type DiffMode } from './diff.ts'
+import { DIFF_TAB_PREFS_KEY, openDiff, readDiffTabPrefs } from './diff.ts'
 import { h } from './dom.ts'
-
-const PREFS_KEY = 'git-log.prefs.diff'
 
 async function start(): Promise<void> {
   let req: DiffTabRequest
@@ -16,13 +14,7 @@ async function start(): Promise<void> {
     document.body.append(h('div', { class: 'diff-note error' }, `Cannot show this diff: ${errorMessage(error)}`))
     return
   }
-  // `changesOnly` (not the older `wholeFile`, saved false by default) so the whole file is the default.
-  let prefs: { mode?: DiffMode; changesOnly?: boolean } = {}
-  try {
-    prefs = JSON.parse(localStorage.getItem(PREFS_KEY) ?? '{}')
-  } catch {
-    prefs = {}
-  }
+  const prefs = readDiffTabPrefs()
   openDiff({
     root: req.root,
     hash: req.hash,
@@ -31,7 +23,13 @@ async function start(): Promise<void> {
     mode: prefs.mode,
     wholeFile: !prefs.changesOnly,
     embedded: true,
-    onPrefs: (mode, wholeFile) => localStorage.setItem(PREFS_KEY, JSON.stringify({ mode, changesOnly: !wholeFile }))
+    onPrefs: (mode, wholeFile) => {
+      try {
+        localStorage.setItem(DIFF_TAB_PREFS_KEY, JSON.stringify({ mode, changesOnly: !wholeFile }))
+      } catch {
+        // Orca's sandboxed frames may have no storage: the layout lasts while the tab is open.
+      }
+    }
   })
 }
 
