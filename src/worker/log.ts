@@ -76,8 +76,11 @@ export function logArgs(filter: LogFilter): string[] {
   return args
 }
 
+/** The `git log` of one page: `limit` entries from `skip`, and one more to tell whether more follow. */
+export const logPageArgs = (filter: LogFilter, skip: number, limit: number) => ['log', `--format=${LOG_FORMAT}`, `--skip=${skip}`, `-n${limit + 1}`, ...logArgs(filter)]
+
 export async function readLogPage(git: Git, filter: LogFilter, skip: number, limit: number): Promise<LogPage> {
-  const result = await git.run(['log', `--format=${LOG_FORMAT}`, `--skip=${skip}`, `-n${limit + 1}`, ...logArgs(filter)])
+  const result = await git.run(logPageArgs(filter, skip, limit))
   // An empty repository (no HEAD yet) is an empty log, not an error.
   if (!result.ok) {
     if (!(await readHead(git)).hash) return { commits: [], hasMore: false }
@@ -95,11 +98,20 @@ export async function readLogPage(git: Git, filter: LogFilter, skip: number, lim
   return { commits, hasMore }
 }
 
+// What the first view of a repository runs, shared with the remote warm-up (warmup.ts) so the
+// answers it fetches ahead are exactly the ones asked for.
+export const HEAD_BRANCH_ARGS = ['symbolic-ref', '-q', '--short', 'HEAD']
+export const HEAD_HASH_ARGS = ['rev-parse', '-q', '--verify', 'HEAD']
+export const REFS_ARGS = ['for-each-ref', '--format=%(refname)%1f%(objectname)%1f%(*objectname)%1f%(upstream:short)', 'refs/heads', 'refs/remotes', 'refs/tags']
+export const USERS_ARGS = ['log', '--branches', '--remotes', '--format=%an', '-n5000']
+export const ME_ARGS = ['config', 'user.name']
+export const UPSTREAM_ARGS = ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']
+export const AHEAD_BEHIND_ARGS = ['rev-list', '--left-right', '--count', 'HEAD...@{upstream}', '--']
+export const UNCOMMITTED_ARGS = ['diff', '--name-status', '-z', '-M', 'HEAD', '--']
+export const UNTRACKED_ARGS = ['ls-files', '--others', '--exclude-standard', '-z', '--']
+
 export async function readHead(git: Git): Promise<{ branch: string | null; hash: string | null }> {
-  const [branch, hash] = await Promise.all([
-    git.run(['symbolic-ref', '-q', '--short', 'HEAD']),
-    git.run(['rev-parse', '-q', '--verify', 'HEAD'])
-  ])
+  const [branch, hash] = await Promise.all([git.run(HEAD_BRANCH_ARGS), git.run(HEAD_HASH_ARGS)])
   return {
     branch: branch.ok ? branch.stdout.trim() || null : null,
     hash: hash.ok ? hash.stdout.trim() || null : null
@@ -124,10 +136,10 @@ export function parseRefs(stdout: string): Pick<RefsResult, 'locals' | 'remotes'
 
 /** The current branch's upstream and how far it is ahead of / behind it. */
 export async function readStatus(git: Git): Promise<BranchStatus> {
-  const upstream = await git.run(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
+  // Both at once (the count just fails without an upstream): one round trip on a remote host.
+  const [upstream, counts] = await Promise.all([git.run(UPSTREAM_ARGS), git.run(AHEAD_BEHIND_ARGS)])
   const name = upstream.ok ? upstream.stdout.trim() : ''
   if (!name) return { upstream: null, ahead: 0, behind: 0 }
-  const counts = await git.run(['rev-list', '--left-right', '--count', 'HEAD...@{upstream}', '--'])
   const [ahead, behind] = counts.ok ? counts.stdout.trim().split(/\s+/).map(Number) : [0, 0]
   return { upstream: name, ahead: ahead || 0, behind: behind || 0 }
 }
@@ -140,12 +152,12 @@ export const UNTRACKED = '?'
 /** What uncommitted changes are measured against: HEAD, or the empty tree before the first commit. */
 export async function worktreeBase(git: Git): Promise<string> {
   const head = await git.run(['rev-parse', '-q', '--verify', 'HEAD^{commit}'])
-  return (head.ok && head.stdout.trim()) || EMPTY_TREE
+  return head.ok && head.stdout.trim() ? 'HEAD' : EMPTY_TREE
 }
 
 /** Untracked files that are not ignored, one path per file (never a folder). */
 export async function readUntracked(git: Git, paths: string[] = []): Promise<string[]> {
-  const result = await git.run(['ls-files', '--others', '--exclude-standard', '-z', '--', ...paths])
+  const result = await git.run([...UNTRACKED_ARGS, ...paths])
   return result.ok ? result.stdout.split('\0').filter(Boolean) : []
 }
 
@@ -154,8 +166,9 @@ export async function readUntracked(git: Git, paths: string[] = []): Promise<str
  * Empty for a bare repository or when git fails.
  */
 export async function readUncommittedFiles(git: Git): Promise<FileChange[]> {
-  const base = await worktreeBase(git)
-  const [diff, untracked] = await Promise.all([git.run(['diff', '--name-status', '-z', '-M', base, '--']), readUntracked(git)])
+  let [diff, untracked] = await Promise.all([git.run(UNCOMMITTED_ARGS), readUntracked(git)])
+  // No HEAD yet (before the first one is recorded): against the empty tree. A bare repository fails either way.
+  if (!diff.ok && (await worktreeBase(git)) === EMPTY_TREE) diff = await git.run(['diff', '--name-status', '-z', '-M', EMPTY_TREE, '--'])
   if (!diff.ok) return []
   const tracked = parseNameStatus(diff.stdout)
   const known = new Set(tracked.map((f) => f.path))
@@ -170,16 +183,10 @@ export async function readUncommitted(git: Git): Promise<number> {
 
 export async function readRefs(git: Git): Promise<RefsResult> {
   const [refs, head, users, me, status, operation, uncommitted] = await Promise.all([
-    git.out([
-      'for-each-ref',
-      '--format=%(refname)%1f%(objectname)%1f%(*objectname)%1f%(upstream:short)',
-      'refs/heads',
-      'refs/remotes',
-      'refs/tags'
-    ]),
+    git.out(REFS_ARGS),
     readHead(git),
-    git.run(['log', '--branches', '--remotes', '--format=%an', '-n5000']),
-    git.run(['config', 'user.name']),
+    git.run(USERS_ARGS),
+    git.run(ME_ARGS),
     readStatus(git),
     operationInProgress(git),
     readUncommitted(git)
@@ -265,11 +272,15 @@ export async function readSelectionFiles(git: Git, hashes: string[]): Promise<Fi
 
 export async function readDetails(git: Git, hash: string): Promise<CommitDetails> {
   assertRevision(hash)
-  const show = await git.out(['show', '-s', '--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%B', hash, '--'])
+  // All three at once, the diff against a first parent it may not have: one round trip on a remote host.
+  const [show, firstParent, containing] = await Promise.all([
+    git.out(['show', '-s', '--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%B', hash, '--']),
+    git.run(['diff', '--name-status', '-z', '-M', `${hash}^1`, hash, '--']),
+    git.run(['for-each-ref', '--contains', hash, '--count=50', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'])
+  ])
   const [full, parents, author, email, at, committer, committerEmail, ct, ...message] = show.split(FS)
   const parentList = parents ? parents.split(' ').filter(Boolean) : []
-  const files = await changesOf(git, full, parentList)
-  const containing = await git.run(['for-each-ref', '--contains', full, '--count=50', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'])
+  const files = parentList.length ? (firstParent.ok ? parseNameStatus(firstParent.stdout) : []) : await changesOf(git, full, parentList)
   return {
     hash: full,
     parents: parentList,

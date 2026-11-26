@@ -135,7 +135,8 @@ export function cliTerminalHost(cli: OrcaCli, environment: string): TerminalHost
           return { terminalId: result.terminal.handle }
         }
         case 'terminal.sendText':
-          await cli(['terminal', 'send', ...on, '--terminal', p.terminalId, '--text', p.text, ...(p.enter ? ['--enter'] : [])])
+          // A newline in the text presses Enter at once; `--enter` waits a moment first (0.5 s against 1.3 s).
+          await cli(['terminal', 'send', ...on, '--terminal', p.terminalId, '--text', p.enter ? `${p.text}\n` : p.text])
           return { accepted: true }
         case 'terminal.read': {
           const result = await cli(['terminal', 'read', ...on, '--terminal', p.terminalId, '--limit', String(p.maxLines ?? 200)])

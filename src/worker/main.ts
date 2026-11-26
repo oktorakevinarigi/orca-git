@@ -13,6 +13,7 @@ import { DIFF_DIR, pickWorkspace, remoteDiffAnchor, remoteExcludeScript, remoteW
 import { shellQuote } from './remote.ts'
 import { createPatch } from './patch.ts'
 import { watchRepo, type RepoWatcher } from './watch.ts'
+import { firstViewCalls } from './warmup.ts'
 
 /** The Git Log tab's file in the workspace folder: Orca names a tab after its file, so it reads "Git Log". */
 export const ANCHOR = 'Git Log.gitlog'
@@ -36,6 +37,12 @@ async function setting<T>(key: string, fallback: T): Promise<T> {
   } catch {
     return fallback
   }
+}
+
+/** Entries of history per page: `limit` when the panel gives one, else the setting (1 to 2000). */
+async function pageSize(limit?: unknown): Promise<number> {
+  const size = Number(limit ?? (await setting('pageSize', 300)))
+  return Math.min(2000, Math.max(1, Number.isFinite(size) ? Math.floor(size) : 300))
 }
 
 const gitPath = () => setting('gitPath', 'git').then((path) => (typeof path === 'string' && path.trim()) || 'git')
@@ -161,7 +168,9 @@ export default function activate(orca: OrcaWorkerApi): void {
   orcaApi = orca
 
   orca.panels.handle('repo.resolve', async (input, context): Promise<RepoResult> => {
-    const result = await resolveRepo(orca, await gitPath(), input?.root, input?.workspaceId)
+    // On a remote host the first view's answers are fetched along with the lookup.
+    const size = await pageSize()
+    const result = await resolveRepo(orca, await gitPath(), input?.root, input?.workspaceId, (root) => firstViewCalls(root, size))
     if (!result.ok) return result
     if (result.git) repos.set(result.repo.root, result.git)
     // A Git Log tab, maybe an untitled one from the + menu: its file stays out of `git status`.
@@ -193,8 +202,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   })
 
   orca.panels.handle('log.page', async ({ root, filter, skip, limit }) => {
-    const pageSize = Number(limit ?? (await setting('pageSize', 300)))
-    const size = Math.min(2000, Math.max(1, Number.isFinite(pageSize) ? Math.floor(pageSize) : 300))
+    const size = await pageSize(limit)
     return readLogPage(await gitFor(root), filter ?? {}, Math.max(0, Math.floor(Number(skip) || 0)), size)
   })
 

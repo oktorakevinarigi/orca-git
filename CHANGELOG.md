@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.1 — 2026-11-26
+
+When Git Log opens, the selected HEAD entry no longer opens its details under its row by itself: the
+row opens when you click it, and a second click folds it again. A project on a paired Orca server now
+opens about four times faster (about a second instead of five on a typical connection, and far less
+than before 0.9.0). Every round trip to the server costs about a second, so the panel's first view
+(HEAD, branches, status, uncommitted changes and the first page of history) now travels with the
+repository lookup in a single trip and is answered from there, the details of an entry take one trip
+instead of three, the check for a rebase or merge in progress takes none of its own, the server's
+workspace is looked up once instead of on every refresh, and text is typed into the server's terminal
+without the pause Orca adds before pressing Enter. The scripts sent to the host are compressed and
+split so each typed line stays under Orca's 4096-character limit.
+
 ## 0.9.0 — 2026-11-26
 
 Git Log opens in an Orca tab more easily, the way Git Control does: a **Git Log** button in the

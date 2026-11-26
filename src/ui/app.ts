@@ -545,6 +545,8 @@ async function reloadLog(keepCount = false): Promise<void> {
     const head = indexByHash.get(repo.head.hash ?? '')
     if (head !== undefined && !selected.size && !uncommittedSelected) {
       selected.add(rows[head].hash)
+      // Selected for the details pane only: it opens under its row when the person clicks it.
+      foldedHash = rows[head].hash
       anchor = head
     }
   }

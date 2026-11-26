@@ -17,8 +17,8 @@ export interface Git {
   run(args: string[], options?: GitOptions): Promise<GitResult>
   /** Runs and returns stdout, throwing a readable Error when git fails. */
   out(args: string[], options?: GitOptions): Promise<string>
-  /** Whether each absolute path exists where the repository lives (this computer or a remote host). */
-  exists(paths: string[]): Promise<boolean[]>
+  /** Whether each of git's own files (`--git-path`, such as MERGE_HEAD) exists, wherever the repository lives. */
+  gitPathsExist(names: string[]): Promise<boolean[]>
   /** Where git runs: on this computer, or on a remote host through a terminal (read-only there). */
   readonly remote?: boolean
 }
@@ -65,6 +65,11 @@ export function createGit(root: string, gitPath = 'git'): Git {
       if (!result.ok) throw new GitError(lastLines(result.stderr || result.stdout) || `git ${args[0]} failed`, result)
       return result.stdout
     },
-    exists: async (paths) => paths.map((path) => existsSync(path))
+    async gitPathsExist(names) {
+      if (!names.length) return []
+      const result = await run(['rev-parse', '--path-format=absolute', ...names.flatMap((name) => ['--git-path', name])])
+      const paths = result.ok ? result.stdout.split(/\r?\n/).map((path) => path.trim()) : []
+      return names.map((_, i) => Boolean(paths[i]) && existsSync(paths[i]))
+    }
   }
 }

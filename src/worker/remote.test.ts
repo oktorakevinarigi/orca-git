@@ -70,7 +70,7 @@ test('git on a remote host reads the same log, refs, details and diffs as local 
   assert.deepEqual(await readUncommittedFiles(remote), await readUncommittedFiles(local))
   assert.deepEqual(await readFileDiff(remote, WORKTREE, 'new file.txt'), await readFileDiff(local, WORKTREE, 'new file.txt'))
   assert.equal(await operationInProgress(remote), null)
-  assert.deepEqual(await remote.exists([root, join(root, 'nope')]), [true, false])
+  assert.deepEqual(await remote.gitPathsExist(['HEAD', 'MERGE_HEAD']), [true, false])
   await assert.rejects(remote.out(['rev-parse', '--verify', 'no-such-ref']), /no-such-ref|Needed a single revision/)
 
   // One helper terminal for everything; calls made together share one typed line.

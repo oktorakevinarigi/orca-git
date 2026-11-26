@@ -150,6 +150,23 @@ test('a workspace on a remote host is read through a helper terminal, read-only'
     assert.equal(resolved.ok && resolved.repo.workspaceId, 'r')
     assert.equal(resolved.ok && resolved.repo.head.branch, 'main')
 
+    // Each round trip to a remote host is slow: the lookup and the whole first view take one.
+    const typed = terminals.typed()
+    assert.equal(typed, 1, 'the lookup and the first view went in one typed line')
+    const [refs, firstPage, uncommitted] = await Promise.all([
+      worker.request('repo.refs', { root }),
+      worker.request('log.page', { root, filter: {}, skip: 0 }),
+      worker.request('repo.uncommittedFiles', { root })
+    ])
+    assert.equal(terminals.typed(), typed, 'answered from what was fetched ahead')
+    assert.equal(refs.head.branch, 'main')
+    assert.equal(refs.uncommitted, 1)
+    assert.equal(firstPage.commits.length, 3)
+    assert.deepEqual(uncommitted.files, [{ status: 'M', path: 'one.txt' }])
+    const details = await worker.request('commit.details', { root, hash: firstPage.commits[0].hash })
+    assert.equal(details.files.length, 1)
+    assert.equal(terminals.typed(), typed + 1, 'the details of one entry take one more')
+
     const page = await worker.request('log.page', { root, filter: {}, skip: 0, limit: 10 })
     assert.deepEqual(page.commits.map((c: { subject: string }) => c.subject), ['three', 'two', 'one'])
     assert.deepEqual((await worker.request('repo.uncommittedFiles', { root })).files, [{ status: 'M', path: 'one.txt' }])

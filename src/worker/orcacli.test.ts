@@ -37,7 +37,7 @@ test('terminal calls become orca terminal commands on the server', async () => {
   await host.call('terminal.close', { terminalId: 'term_1' })
   assert.deepEqual(calls, [
     ['terminal', 'create', '--environment', 'env-1', '--worktree', 'identity:wt2:local:aaa', '--title', 'T', '--command', ' printf x'],
-    ['terminal', 'send', '--environment', 'env-1', '--terminal', 'term_1', '--text', 'ls', '--enter'],
+    ['terminal', 'send', '--environment', 'env-1', '--terminal', 'term_1', '--text', 'ls\n'],
     ['terminal', 'read', '--environment', 'env-1', '--terminal', 'term_1', '--limit', '2000'],
     ['terminal', 'close', '--environment', 'env-1', '--terminal', 'term_1']
   ])

@@ -5,7 +5,7 @@
 // A terminal read returns at most ~32 KB, so a larger answer stays in a temporary folder on the
 // host and is read in pieces.
 import { randomBytes } from 'node:crypto'
-import { gunzipSync } from 'node:zlib'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import { GitError, lastLines, type Git, type GitOptions, type GitResult } from './git.ts'
 
 /** What the transport needs from the worker's `orca.host`. */
@@ -15,25 +15,35 @@ export interface TerminalHost {
 
 export type RemoteCall =
   | { kind: 'git'; cwd: string; args: string[]; env?: Record<string, string> }
-  | { kind: 'exists'; path: string }
+  /** Whether git's own file `name` (`--git-path`) exists in the repository at `cwd`. */
+  | { kind: 'gitpath'; cwd: string; name: string }
   /** A short sh script run in `cwd` (with `g` for git), for the plugin's own files on the host. */
   | { kind: 'sh'; cwd: string; script: string }
 
-/** Characters of packed output read per terminal read: well under the host's 32 KB budget. */
-export const CHUNK_CHARS = 24_000
+/** Characters of packed output read per terminal read: under the host's 32 KB budget, with room for the prompt. */
+export const CHUNK_CHARS = 30_000
 const LINE_CHARS = 76
 const BATCH_DELAY_MS = 8
 const MAX_BATCH = 40
 const MAX_PAYLOAD_CHARS = 48 * 1024 * 1024
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 const TERMINAL_TITLE = 'Git Log (remote git)'
+/** How long answers fetched ahead by `warm` are used instead of asking the host again. */
+export const WARM_TTL_MS = 10_000
+
+/** What makes two calls the same call, for answers fetched ahead; null for calls never fetched ahead. */
+function callKey(call: RemoteCall): string | null {
+  if (call.kind === 'git') return call.env ? null : JSON.stringify(['git', call.cwd, call.args])
+  if (call.kind === 'gitpath') return JSON.stringify(['gitpath', call.cwd, call.name])
+  return null
+}
 
 export const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`
 
 const marker = (nonce: string, end: 'B' | 'E') => `GLB${nonce}${end}`
 const workDir = (nonce: string) => `"\${TMPDIR:-/tmp}/orca-git-log-${nonce}"`
 
-/** The script that runs `calls` and prints, between markers, how big the packed results are and (when small) the results. */
+/** The script that runs `calls` and prints, between markers, how big the packed results are and their first piece (all of them when small). */
 export function batchScript(calls: RemoteCall[], nonce: string): string {
   const lines = [
     `d=${workDir(nonce)}`,
@@ -42,8 +52,8 @@ export function batchScript(calls: RemoteCall[], nonce: string): string {
   ]
   calls.forEach((call, i) => {
     const files = `>"$d/${i}o" 2>"$d/${i}e"`
-    if (call.kind === 'exists') {
-      lines.push(`[ -e ${shellQuote(call.path)} ] ${files}; echo $? >"$d/${i}c"`)
+    if (call.kind === 'gitpath') {
+      lines.push(`{ p=$(cd ${shellQuote(call.cwd)} && g rev-parse --path-format=absolute --git-path ${shellQuote(call.name)}) && [ -e "$p" ]; } ${files}; echo $? >"$d/${i}c"`)
       return
     }
     if (call.kind === 'sh') {
@@ -58,10 +68,12 @@ export function batchScript(calls: RemoteCall[], nonce: string): string {
   })
   const all = calls.map((_, i) => i).join(' ')
   lines.push(
-    `{ for i in ${all}; do printf '%s %s %s\\n' "$(cat "$d/$i"c)" $(wc -c <"$d/$i"o) $(wc -c <"$d/$i"e); done; for i in ${all}; do cat "$d/$i"o "$d/$i"e; done; } | gzip -c | base64 | tr -d '\\n' >"$d/p"`,
+    `{ for i in ${all}; do printf '%s %s %s\\n' "$(cat "$d/$i"c)" $(wc -c <"$d/$i"o) $(wc -c <"$d/$i"e); done; for i in ${all}; do cat "$d/$i"o "$d/$i"e; done; } | gzip -9c | base64 | tr -d '\\n' >"$d/p"`,
     'n=$(wc -c <"$d/p" | tr -d " ")',
     `echo; printf '%s %s\\n' ${marker(nonce, 'B')} "$n"`,
-    `if [ "$n" -le ${CHUNK_CHARS} ]; then fold -w ${LINE_CHARS} "$d/p"; echo; rm -rf "$d"; fi`,
+    // The first piece comes with the answer: a larger one needs only the rest read after it.
+    `cut -c 1-${CHUNK_CHARS} "$d/p" | fold -w ${LINE_CHARS}; echo`,
+    `if [ "$n" -le ${CHUNK_CHARS} ]; then rm -rf "$d"; fi`,
     `echo ${marker(nonce, 'E')}`
   )
   return lines.join('\n')
@@ -79,7 +91,10 @@ export function chunkScript(batchNonce: string, nonce: string, from: number, to:
 }
 
 /** What one terminal line types: the script as base64, so no login shell (bash, zsh, fish) parses it. The leading space keeps it out of shell history. */
-export const typedLine = (script: string) => ` printf %s ${Buffer.from(script, 'utf8').toString('base64')} | base64 -d | sh`
+export const typedLine = (script: string) => ` printf %s ${gzipSync(Buffer.from(script, 'utf8')).toString('base64')} | base64 -d | gzip -dc | sh`
+
+/** Longest line Orca lets a plugin type into a terminal (4096 characters), with room to spare. */
+export const MAX_TYPED_CHARS = 4000
 
 /** The answer between the markers of `nonce`, once its end marker has been printed; null before. */
 export function readAnswer(lines: string[], nonce: string): { size: number | null; text: string } | null {
@@ -126,6 +141,8 @@ export class RemoteShell {
   private chain: Promise<void> = Promise.resolve()
   private readonly host: TerminalHost
   private readonly timing: { pollMs: number; timeoutMs: number }
+  /** Answers fetched ahead (`warm`), by call, while still in flight too. */
+  private warmed = new Map<string, { answer: Promise<GitResult>; until: number }>()
   readonly workspaceId: string
 
   constructor(host: TerminalHost, workspaceId: string, timing = { pollMs: 120, timeoutMs: 90_000 }) {
@@ -135,10 +152,33 @@ export class RemoteShell {
   }
 
   run(call: RemoteCall): Promise<GitResult> {
+    const key = callKey(call)
+    const warm = key ? this.warmed.get(key) : undefined
+    if (warm && warm.until > Date.now()) return warm.answer
     return new Promise((resolve, reject) => {
       this.queue.push({ call, resolve, reject })
       this.schedule()
     })
+  }
+
+  /**
+   * Sends `calls` with the next batch and keeps their answers for a few seconds: the same calls
+   * made meanwhile (or still waiting for this batch) need no round trip of their own. Answers
+   * fetched ahead earlier are dropped first, so a refresh always reads afresh.
+   */
+  warm(calls: RemoteCall[], ttlMs = WARM_TTL_MS): void {
+    this.warmed.clear()
+    for (const call of calls) {
+      const key = callKey(call)
+      if (!key || this.warmed.has(key)) continue
+      const answer = new Promise<GitResult>((resolve, reject) => {
+        this.queue.push({ call, resolve, reject })
+        this.schedule()
+      })
+      const entry = { answer, until: Date.now() + ttlMs }
+      this.warmed.set(key, entry)
+      answer.catch(() => this.warmed.get(key) === entry && this.warmed.delete(key))
+    }
   }
 
   async close(): Promise<void> {
@@ -157,7 +197,13 @@ export class RemoteShell {
 
   private async drain(): Promise<void> {
     this.scheduled = false
-    const batch = this.queue.splice(0, MAX_BATCH)
+    // As many calls as one typed line holds; the rest go in the next batch.
+    const batch: Pending[] = []
+    while (this.queue.length && batch.length < MAX_BATCH) {
+      const next = [...batch, this.queue[0]].map((p) => p.call)
+      if (batch.length && typedLine(batchScript(next, '0'.repeat(12))).length > MAX_TYPED_CHARS) break
+      batch.push(this.queue.shift()!)
+    }
     if (this.queue.length) this.schedule()
     if (!batch.length) return
     try {
@@ -175,8 +221,8 @@ export class RemoteShell {
     if (!(size > 0 && size <= MAX_PAYLOAD_CHARS)) throw new Error('The remote host sent no usable answer (it needs sh, git, gzip and base64).')
     let packed = first.text
     if (size > CHUNK_CHARS) {
-      const parts: string[] = []
-      for (let from = 1; from <= size; from += CHUNK_CHARS) {
+      const parts: string[] = [first.text]
+      for (let from = CHUNK_CHARS + 1; from <= size; from += CHUNK_CHARS) {
         const to = Math.min(size, from + CHUNK_CHARS - 1)
         const piece = hex()
         parts.push((await this.exchange(chunkScript(nonce, piece, from, to, to === size), piece)).text)
@@ -232,6 +278,6 @@ export function createRemoteGit(shell: RemoteShell, root: string): Git {
       if (!result.ok) throw new GitError(lastLines(result.stderr || result.stdout) || `git ${args[0]} failed`, result)
       return result.stdout
     },
-    exists: (paths) => Promise.all(paths.map((path) => shell.run({ kind: 'exists', path }).then((result) => result.ok)))
+    gitPathsExist: (names) => Promise.all(names.map((name) => shell.run({ kind: 'gitpath', cwd: root, name }).then((result) => result.ok)))
   }
 }

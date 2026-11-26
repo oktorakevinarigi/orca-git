@@ -152,19 +152,19 @@ export async function gitPath(git: Git, name: string): Promise<string> {
   return (await git.out(['rev-parse', '--path-format=absolute', '--git-path', name])).trim()
 }
 
+/** git's own files that mean an operation was left in progress, and which one. */
+export const OPERATION_FILES: [string, 'rebase' | 'merge' | 'cherry-pick' | 'revert'][] = [
+  ['rebase-merge', 'rebase'],
+  ['rebase-apply', 'rebase'],
+  ['MERGE_HEAD', 'merge'],
+  ['CHERRY_PICK_HEAD', 'cherry-pick'],
+  ['REVERT_HEAD', 'revert']
+]
+
 export async function operationInProgress(git: Git): Promise<'rebase' | 'merge' | 'cherry-pick' | 'revert' | null> {
-  const checks: [string, 'rebase' | 'merge' | 'cherry-pick' | 'revert'][] = [
-    ['rebase-merge', 'rebase'],
-    ['rebase-apply', 'rebase'],
-    ['MERGE_HEAD', 'merge'],
-    ['CHERRY_PICK_HEAD', 'cherry-pick'],
-    ['REVERT_HEAD', 'revert']
-  ]
-  // One call for every path, then one existence check: each call is a round trip on a remote host.
-  const paths = (await git.out(['rev-parse', '--path-format=absolute', ...checks.flatMap(([name]) => ['--git-path', name])])).split(/\r?\n/)
-  const found = await git.exists(checks.map((_, i) => paths[i]?.trim() ?? ''))
+  const found = await git.gitPathsExist(OPERATION_FILES.map(([name]) => name))
   const index = found.indexOf(true)
-  return index >= 0 ? checks[index][1] : null
+  return index >= 0 ? OPERATION_FILES[index][1] : null
 }
 
 /** Remote branches that already contain `hash`: rewriting it then needs a force push. */
