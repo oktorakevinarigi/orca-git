@@ -1,14 +1,14 @@
-import type { ActionRequest, ActionResult, BranchRef, CommitRow, FileChange, LogFilter, RefsResult, RepoInfo, RepoResult, RewriteKind, WorkspaceChoice } from '../shared/protocol.ts'
+import type { ActionRequest, ActionResult, BranchRef, CommitDetails, CommitRow, FileChange, LogFilter, RefsResult, RepoInfo, RepoResult, RewriteKind, WorkspaceChoice } from '../shared/protocol.ts'
 import { api, copyText, errorMessage, orca } from './api.ts'
 import { renderBranches } from './branches.ts'
 import { addColumnResizers, validColumnWidths, type ColumnWidths } from './columns.ts'
-import { renderDetails, renderMany, renderPlaceholder, renderUncommitted } from './details.ts'
+import { commitSummary, renderDetails, renderMany, renderPlaceholder, renderUncommitted } from './details.ts'
 import { openDiff, type DiffMode } from './diff.ts'
 import { askDirtyCheckout, askName, askPatch, askPush, askRebasePlan, askReset, busy, confirm, editMessage, pushedWarning } from './dialogs.ts'
 import { append, h, icon } from './dom.ts'
 import { createFilterBar } from './filters.ts'
 import { reachableFrom, refLabels, relativeDate, fullDate, shortHash, WORKTREE } from './format.ts'
-import { computeGraph, graphLanes, graphSvg, ROW_HEIGHT, type GraphRow } from './graph.ts'
+import { computeGraph, graphGapSvg, graphLanes, graphSvg, ROW_HEIGHT, type GraphRow } from './graph.ts'
 import { showMenu, type MenuEntry } from './menu.ts'
 
 const MODE = document.body.dataset.mode === 'editor' ? 'editor' : 'panel'
@@ -67,6 +67,12 @@ let uncommitted = 0
 let uncommittedGraph: GraphRow | null = null
 /** The "Uncommitted Changes" row is selected (then no commit is). */
 let uncommittedSelected = false
+/** The selected commit opened under its row: its facts and message, `height` pixels tall. */
+let expanded: { hash: string; content: HTMLElement; height: number } | null = null
+/** The commit the user folded by clicking it again; it stays folded while it is selected. */
+let foldedHash: string | null = null
+/** Scroll the expanded commit into view once its height is known. */
+let revealExpanded = false
 let reachable = new Set<string>()
 /** First-parent chain from HEAD within the loaded rows, newest first. */
 let mainline: CommitRow[] = []
@@ -102,7 +108,7 @@ const refreshButton = h('button', { class: 'tool', title: 'Refresh' }, icon('ref
 const fetchButton = h('button', { class: 'tool', title: 'Fetch all remotes' }, icon('fetch'))
 const pushButton = h('button', { class: 'tool', title: 'Push…' }, icon('push'))
 const statusChip = h('button', { class: 'status-chip', hidden: true })
-const tabButton = h('button', { class: 'tool', title: 'Open Git Log in an editor tab' }, icon('external'))
+const tabButton = h('button', { class: 'tool', title: 'Open Git Log in a tab' }, icon('external'))
 
 const filterBar = createFilterBar({
   get filter() {
@@ -340,9 +346,72 @@ function pick(choice: WorkspaceChoice): void {
   void start()
 }
 
+/** Height of the expanded commit's area before its contents are measured. */
+const EXPANDED_FIRST_HEIGHT = 150
+
 /** Rows start below the "Uncommitted Changes" row when it is shown. */
 const rowsOffset = () => (uncommittedGraph ? ROW_HEIGHT : 0)
-const rowTop = (index: number) => rowsOffset() + index * ROW_HEIGHT
+const expandedIndex = () => (expanded ? indexByHash.get(expanded.hash) ?? -1 : -1)
+/** Rows below the expanded commit move down by the height of its details. */
+const rowTop = (index: number) => {
+  const at = expandedIndex()
+  return rowsOffset() + index * ROW_HEIGHT + (at >= 0 && index > at ? expanded!.height : 0)
+}
+/** The row at `y` pixels from the top of the log; inside the expanded area, the expanded commit. */
+function rowAt(y: number): number {
+  const at = expandedIndex()
+  let offset = y - rowsOffset()
+  if (at >= 0 && offset > (at + 1) * ROW_HEIGHT) offset = Math.max((at + 1) * ROW_HEIGHT - 1, offset - expanded!.height)
+  return Math.floor(offset / ROW_HEIGHT)
+}
+
+/** The expanded commit's details, with its graph lanes drawn on through them. */
+function expandedElement(index: number): HTMLElement {
+  const gap = h('div', { class: 'expanded-graph' })
+  gap.innerHTML = graphGapSvg(graph[index], expanded!.height, { lanes: graphColumnLanes })
+  return h('div', { class: 'commit-expanded', style: `top:${rowTop(index) + ROW_HEIGHT}px;height:${expanded!.height}px` }, gap, expanded!.content)
+}
+
+/** Opens the single selected commit under its row (unless the user folded it), closing any other. */
+function syncExpansion(hash: string | null): void {
+  if (hash !== foldedHash) foldedHash = null
+  const next = hash && hash !== foldedHash && indexByHash.has(hash) ? hash : null
+  if (next === (expanded?.hash ?? null)) return
+  const was = expandedIndex()
+  const wasHeight = expanded?.height ?? 0
+  expanded = next
+    ? { hash: next, content: h('div', { class: 'expanded-content' }, h('div', { class: 'commit-summary muted' }, 'Loading…')), height: EXPANDED_FIRST_HEIGHT }
+    : null
+  // A commit further down moves up when the one above it closes: keep it where it was clicked.
+  if (was >= 0 && next && indexByHash.get(next)! > was) viewport.scrollTop = Math.max(0, viewport.scrollTop - wasHeight)
+  revealExpanded = Boolean(next)
+  renderRows()
+}
+
+/** Shows the loaded details in the expanded area, if that commit is still the one expanded. */
+function fillExpansion(details: CommitDetails): void {
+  if (expanded?.hash !== details.hash) return
+  expanded.content.replaceChildren(commitSummary(details, (hash) => void jumpTo(hash)))
+  revealExpanded = true
+  renderRows()
+}
+
+/** Measures the expanded area after a render; renders again when its height changed. */
+function measureExpansion(): void {
+  const at = expandedIndex()
+  if (!expanded || at < 0 || !expanded.content.isConnected) return
+  const height = Math.ceil(expanded.content.offsetHeight)
+  if (height && Math.abs(height - expanded.height) > 1) {
+    expanded.height = height
+    renderRows()
+    return
+  }
+  if (!revealExpanded) return
+  revealExpanded = false
+  const top = rowTop(at)
+  const bottom = top + ROW_HEIGHT + expanded.height
+  if (bottom > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = Math.min(top, bottom - viewport.clientHeight)
+}
 
 /** The work tree's changes, as Git Graph shows them: a dashed node above HEAD. Selecting it lists the files. */
 function uncommittedElement(row: GraphRow): HTMLElement {
@@ -422,17 +491,21 @@ function renderRows(): void {
     renderQueued = false
     const top = viewport.scrollTop
     const height = viewport.clientHeight || 600
-    const offset = rowsOffset()
-    const first = Math.max(0, Math.floor((top - offset) / ROW_HEIGHT) - 10)
-    const last = Math.min(rows.length, Math.ceil((top - offset + height) / ROW_HEIGHT) + 10)
-    sizer.style.height = `${offset + (rows.length + (hasMore ? 1 : 0)) * ROW_HEIGHT}px`
+    const at = expandedIndex()
+    const first = Math.max(0, rowAt(top) - 10)
+    const last = Math.min(rows.length, rowAt(top + height) + 11)
+    sizer.style.height = `${rowsOffset() + (rows.length + (hasMore ? 1 : 0)) * ROW_HEIGHT + (at >= 0 ? expanded!.height : 0)}px`
     const children: HTMLElement[] = []
     if (uncommittedGraph && first === 0) children.push(uncommittedElement(uncommittedGraph))
-    for (let i = first; i < last; i++) children.push(rowElement(i))
+    for (let i = first; i < last; i++) {
+      children.push(rowElement(i))
+      if (i === at) children.push(expandedElement(i))
+    }
     if (hasMore && last >= rows.length) {
       children.push(h('div', { class: 'loading-more', style: `top:${rowTop(rows.length)}px` }, h('div', { class: 'spin' })))
     }
     sizer.replaceChildren(...children)
+    measureExpansion()
     renderEmpty()
     if (hasMore && !loading && !loadError && last >= rows.length - 40) void loadMore()
   })
@@ -576,6 +649,9 @@ function renderStatus(): void {
     .join('\n')
   pushButton.disabled = !head.branch
   pushButton.title = head.branch ? `Push ${head.branch}…` : 'Check out a branch to push it'
+  // Fetch and push change the repository: not on a remote host yet.
+  fetchButton.hidden = pushButton.hidden = Boolean(repo.remote)
+  if (repo.remote) statusChip.title += '\nOn a remote host: read-only'
 }
 
 let refreshing: Promise<void> | null = null
@@ -583,7 +659,7 @@ async function refreshAll(): Promise<void> {
   if (refreshing) return refreshing
   refreshing = (async () => {
     if (!repo) return start()
-    const result = await api.resolve(repo.root).catch((error) => ({ ok: false as const, reason: errorMessage(error) }))
+    const result = await api.resolve(repo.root, repo.workspaceId).catch((error) => ({ ok: false as const, reason: errorMessage(error) }))
     if (!result.ok) {
       loadError = result.reason
       renderEmpty()
@@ -618,6 +694,7 @@ function setRepo(next: RepoInfo): void {
     viewport.scrollTop = 0
     document.title = `Git Log: ${next.name}`
     void api.watch(next.root).catch(() => undefined)
+    if (next.remote) showBanner('This project is on a remote host: its history, details and changes are read there through a terminal, read-only.', 'info')
   }
   if (next.operation) showOperationBanner()
   void loadRefs()
@@ -637,7 +714,7 @@ async function start(): Promise<void> {
     }
   }
   try {
-    let result: RepoResult = await api.resolve(root)
+    let result: RepoResult = await api.resolve(root, docWorkspaceId)
     if (!result.ok && result.choices?.length) {
       const saved = prefs.picked[choiceKey(result.choices)]
       if (saved && result.choices.some((c) => c.id === saved)) result = await api.resolve(undefined, saved)
@@ -804,7 +881,7 @@ function branchMenu(event: MouseEvent, ref: BranchRef & { kind: 'local' | 'remot
     { icon: 'search', label: filter.branches?.includes(ref.full) ? 'Show All Branches' : `Show Only '${ref.name}'`, run: () => applyFilter({ branches: filter.branches?.includes(ref.full) ? [] : [ref.full] }) },
     { label: 'Copy Name', icon: 'copy', run: () => copyText(ref.name) }
   )
-  showMenu(event.clientX, event.clientY, entries)
+  showMenu(event.clientX, event.clientY, readOnlyOnRemote(entries, (label) => label.startsWith('Copy ') || label.startsWith('Show ')))
 }
 
 /** Checks out `target`, asking first what to do with uncommitted changes. */
@@ -979,6 +1056,9 @@ viewport.addEventListener('mousedown', (event) => {
     else selected.add(hash)
     anchor = cursor = index
     selectionChanged()
+  } else if (selected.size === 1 && selected.has(hash) && !uncommittedSelected) {
+    foldedHash = expanded?.hash === hash ? hash : null
+    updateDetails()
   } else selectOnly(index)
 })
 
@@ -1028,6 +1108,7 @@ viewport.addEventListener('keydown', (event) => {
     case 'c':
     case 'C':
       if (!mod || !selected.size) return
+      if (String(getSelection() ?? '').trim()) return
       copyHashes()
       break
     case 'F10':
@@ -1064,8 +1145,10 @@ async function showDiff(root: string, hash: string, files: FileChange[], index: 
     const workspaceId = repo?.workspaceId ?? docWorkspaceId
     const result = await api.openDiffTab({ root, hash, files, index, ...(workspaceId ? { workspaceId } : {}) })
     if (result.ok) return
-  } catch {
-    // Fall through to the in-frame viewer.
+    // Locally a missing workspace (a web client) just falls back; on a remote host, say why.
+    if (repo?.remote && result.reason) showBanner(`The diff tab could not open: ${result.reason}`, 'error')
+  } catch (error) {
+    if (repo?.remote) showBanner(`The diff tab could not open: ${errorMessage(error)}`, 'error')
   }
   openDiff({
     root,
@@ -1115,19 +1198,21 @@ function updateUncommittedDetails(root: string, token: number): void {
 
 function updateDetails(): void {
   clearTimeout(detailsTimer)
-  if (!prefs.details) return
+  const hashes = uncommittedSelected ? [] : selectedHashes()
+  syncExpansion(hashes.length === 1 ? hashes[0] : null)
+  if (!prefs.details && !expanded) return
   if (repo && uncommittedSelected) {
-    updateUncommittedDetails(repo.root, ++detailsToken)
+    if (prefs.details) updateUncommittedDetails(repo.root, ++detailsToken)
     return
   }
-  const hashes = selectedHashes()
   if (!repo || !hashes.length) {
-    renderPlaceholder(detailsPane, repo ? 'Select a commit to see its details.' : '')
+    if (prefs.details) renderPlaceholder(detailsPane, repo ? 'Select a commit to see its details.' : '')
     return
   }
   const token = ++detailsToken
   const root = repo.root
   if (hashes.length > 1) {
+    if (!prefs.details) return
     const commits = hashes.map((hash) => rows[indexByHash.get(hash)!]).filter(Boolean)
     const host = {
       select: (hash: string) => void jumpTo(hash),
@@ -1150,13 +1235,13 @@ function updateDetails(): void {
   detailsTimer = setTimeout(async () => {
     try {
       const details = await api.details(root, hashes[0])
-      if (token === detailsToken)
-        renderDetails(detailsPane, details, {
-          select: (hash) => void jumpTo(hash),
-          openDiff: (index) => void showDiff(root, details.hash, details.files, index)
-        })
+      if (token !== detailsToken) return
+      fillExpansion(details)
+      if (prefs.details) renderDetails(detailsPane, details, { openDiff: (index) => void showDiff(root, details.hash, details.files, index) })
     } catch (error) {
-      if (token === detailsToken) renderPlaceholder(detailsPane, errorMessage(error))
+      if (token !== detailsToken) return
+      if (prefs.details) renderPlaceholder(detailsPane, errorMessage(error))
+      expanded?.content.replaceChildren(h('div', { class: 'commit-summary muted' }, errorMessage(error)))
     }
   }, 80)
 }
@@ -1388,7 +1473,16 @@ function commitMenu(x: number, y: number): void {
     { label: 'New Branch…', icon: 'branch', disabled: !single, hint: 'Select one commit', run: () => void newBranch(single!.hash) },
     { label: 'New Tag…', icon: 'tag', disabled: !single, hint: 'Select one commit', run: () => void newTag(single!.hash) }
   )
-  showMenu(x, y, entries, viewport)
+  showMenu(x, y, readOnlyOnRemote(entries, (label) => label.startsWith('Copy ')), viewport)
+}
+
+/** Why a change is refused on a project on another host, where git is only read through a terminal. */
+const REMOTE_HINT = 'Not available for a project on a remote host yet'
+
+/** On a remote host the log only reads: every entry but `keep` is turned off, with the reason. */
+function readOnlyOnRemote(entries: MenuEntry[], keep: (label: string) => boolean): MenuEntry[] {
+  if (!repo?.remote) return entries
+  return entries.map((entry) => (entry === 'separator' || keep(entry.label) ? entry : { ...entry, disabled: true, hint: REMOTE_HINT }))
 }
 
 // ---------- Toolbar & host events ----------

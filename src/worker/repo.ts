@@ -5,10 +5,19 @@ import type { RepoInfo, RepoResult, WorkspaceChoice } from '../shared/protocol.t
 import { createGit, type Git } from './git.ts'
 import { readHead } from './log.ts'
 import { operationInProgress } from './rebase.ts'
+import { cliTerminalHost, createOrcaCli, findOrcaCli, matchServerWorkspace, serverWorkspaces, type OrcaCli } from './orcacli.ts'
+import { createRemoteGit, RemoteShell, type TerminalHost } from './remote.ts'
 
 export interface Workspace {
+  /** Its id in Orca's window (what `editor.open` takes). */
   id: string
   path: string
+  /** On another host (SSH or a paired Orca server): its files and git are reached through a terminal. */
+  remote?: boolean
+  /** On a paired Orca server, reached with Orca's command line: the server (`--environment`)... */
+  environment?: string
+  /** ...and the workspace there (`--worktree`). */
+  selector?: string
 }
 
 export interface ListedWorkspace {
@@ -20,12 +29,14 @@ export interface ListedWorkspace {
 }
 
 interface Context {
+  /** Since host API 1.x: the same id `workspace.list` gives, when the workspace is in it. */
+  workspaceId?: string
   branch: string
   displayName: string
   terminals?: { id: string; title?: string }[]
 }
 
-export type Match = { workspace: ListedWorkspace } | { remote: true } | { ambiguous: ListedWorkspace[] } | null
+export type Match = { workspace: ListedWorkspace } | { remote: ListedWorkspace } | { ambiguous: ListedWorkspace[] } | null
 
 const shortBranch = (branch: string | null | undefined) => (branch ?? '').replace(/^refs\/heads\//, '')
 const slashes = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
@@ -62,7 +73,11 @@ export function matchWorkspace(context: Context, workspaces: ListedWorkspace[], 
   const sameBranch = pool.filter((w) => shortBranch(w.branch) === shortBranch(context.branch))
   if (sameBranch.length) pool = sameBranch
   const local = pool.filter(isLocal)
-  if (!local.length) return pool.length ? { remote: true } : null
+  if (!local.length) {
+    // Only on other hosts: one of them, or the one picked before, else ask.
+    const picked = pool.find((w) => w.id === prefer) ?? (pool.length === 1 ? pool[0] : undefined)
+    return picked ? { remote: picked } : pool.length ? { ambiguous: pool } : null
+  }
   if (local.length === 1) return { workspace: local[0] }
 
   const titles = (context.terminals ?? []).map((t) => slashes(t.title ?? '')).filter(Boolean)
@@ -82,9 +97,26 @@ export async function focusedWorkspace(
   const context = (await orca.host.call('workspace.readContext', {})) as Context | null
   if (!context) return { reason: 'Open a workspace to see its Git log.' }
   const { workspaces } = (await orca.host.call('workspace.list', {})) as { workspaces: ListedWorkspace[] }
+  if (context.workspaceId) {
+    // The focused workspace by its id: never a same-named copy on another host.
+    const exact = workspaces.find((w) => w.id === context.workspaceId)
+    if (exact) {
+      lastChoice = exact.id
+      return isLocal(exact) ? { id: exact.id, path: exact.path } : { id: exact.id, path: exact.path, remote: true }
+    }
+    // Not covered by this computer's Orca: a workspace of a paired Orca server.
+    const server = await serverWorkspace({ workspaceId: context.workspaceId, displayName: context.displayName, branch: context.branch })
+    if (server) return server
+    return {
+      reason: `Git Log cannot reach "${context.displayName}": it is on a paired Orca server, which Git Log reaches with Orca's command line (orca), and that was not found or does not list it.`
+    }
+  }
   const match = matchWorkspace(context, workspaces, prefer ?? lastChoice)
   if (!match) return { reason: `Workspace "${context.displayName}" was not found.` }
-  if ('remote' in match) return { reason: 'Remote workspaces (SSH, WSL, paired hosts) are not supported yet.' }
+  if ('remote' in match) {
+    lastChoice = match.remote.id
+    return { id: match.remote.id, path: match.remote.path, remote: true }
+  }
   if ('ambiguous' in match) {
     return {
       reason: `Several workspaces are named "${context.displayName}". Pick the one you are in:`,
@@ -93,6 +125,80 @@ export async function focusedWorkspace(
   }
   lastChoice = match.workspace.id
   return { id: match.workspace.id, path: match.workspace.path }
+}
+
+let cli: Promise<OrcaCli | null> | null = null
+const orcaCli = () => (cli ??= findOrcaCli().then((command) => (command ? createOrcaCli(command) : null)))
+
+/** A paired Orca server's workspace, found with Orca's command line; null when none matches (or there is no command line). */
+async function serverWorkspace(want: { workspaceId?: string | null; path?: string; displayName?: string; branch?: string | null }): Promise<Workspace | null> {
+  const run = await orcaCli()
+  if (!run) return null
+  const found = matchServerWorkspace(await serverWorkspaces(run).catch(() => []), want)
+  if (!found) return null
+  return { id: want.workspaceId ?? found.selector, path: found.path, remote: true, environment: found.environment, selector: found.selector }
+}
+
+/** Remote repositories resolved so far, by root, with the workspace they were found in. */
+const remoteRoots = new Map<string, Workspace>()
+
+/** The workspace on another host that holds `root` (the one asked for first); null when none does. */
+export async function remoteWorkspaceFor(orca: OrcaWorkerApi, root: string, prefer?: string | null): Promise<Workspace | null> {
+  const known = remoteRoots.get(root)
+  if (known) return known
+  const { workspaces } = (await orca.host.call('workspace.list', {})) as { workspaces: ListedWorkspace[] }
+  const holds = (w: ListedWorkspace) => {
+    const path = w.path.replace(/\/+$/, '')
+    return root === path || root.startsWith(`${path}/`) || path.startsWith(`${root}/`)
+  }
+  const remote = workspaces.filter((w) => !isLocal(w) && holds(w))
+  const found = remote.find((w) => w.id === prefer) ?? remote[0]
+  if (found) return { id: found.id, path: found.path, remote: true }
+  return serverWorkspace({ path: root, workspaceId: prefer })
+}
+
+const shells = new Map<string, RemoteShell>()
+
+/**
+ * The helper terminal of a workspace on another host, shared by every repository in it: through
+ * the host API for this computer's SSH targets, through Orca's command line on a paired server.
+ */
+export async function remoteShell(orca: OrcaWorkerApi, workspace: Workspace): Promise<RemoteShell> {
+  const key = workspace.environment ? `${workspace.environment}|${workspace.selector}` : workspace.id
+  let shell = shells.get(key)
+  if (shell) return shell
+  if (workspace.environment) {
+    const run = await orcaCli()
+    if (!run) throw new Error("Orca's command line (orca) was not found.")
+    shell = new RemoteShell(cliTerminalHost(run, workspace.environment), workspace.selector!)
+  } else {
+    shell = new RemoteShell(orca.host as TerminalHost, workspace.id)
+  }
+  shells.set(key, shell)
+  return shell
+}
+
+export async function closeRemoteShells(): Promise<void> {
+  const all = [...shells.values()]
+  shells.clear()
+  await Promise.all(all.map((shell) => shell.close()))
+}
+
+/** The repository holding `folder` (the workspace's own by default) on its host, checked by git there. */
+async function resolveRemote(orca: OrcaWorkerApi, workspace: Workspace, folder = workspace.path): Promise<RepoResult & { git?: Git }> {
+  let top
+  let shell: RemoteShell
+  try {
+    shell = await remoteShell(orca, workspace)
+    top = await createRemoteGit(shell, folder).run(['rev-parse', '--show-toplevel'])
+  } catch (error) {
+    return { ok: false, reason: `Could not run git on the remote host: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  const root = top.stdout.trim()
+  if (!top.ok || !root) return { ok: false, reason: `${basename(folder)} is not a Git repository.` }
+  remoteRoots.set(root, workspace)
+  const git = createRemoteGit(shell, root)
+  return { ok: true, repo: { ...(await describeRepo(git, root, workspace.id)), remote: true }, git }
 }
 
 export async function toplevel(path: string, gitPath: string): Promise<string | null> {
@@ -114,11 +220,18 @@ export async function resolveRepo(
   let path: string
   let workspaceId: string | null = null
   if (requested) {
-    if (!isAbsolute(requested) || !existsSync(requested)) return { ok: false, reason: `${requested} no longer exists.` }
+    if (!isAbsolute(requested) && !requested.startsWith('/')) return { ok: false, reason: `${requested} no longer exists.` }
+    if (!existsSync(requested)) {
+      // Not on this computer: a repository in a workspace on another host.
+      const remote = await remoteWorkspaceFor(orca, requested, prefer)
+      if (!remote) return { ok: false, reason: `${requested} no longer exists.` }
+      return resolveRemote(orca, remote, requested)
+    }
     path = requested
   } else {
     const workspace = await focusedWorkspace(orca, prefer)
     if ('reason' in workspace) return { ok: false, ...workspace }
+    if (workspace.remote) return resolveRemote(orca, workspace)
     path = workspace.path
     workspaceId = workspace.id
   }

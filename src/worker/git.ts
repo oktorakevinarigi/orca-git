@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 
 export interface GitResult {
   ok: boolean
@@ -16,6 +17,10 @@ export interface Git {
   run(args: string[], options?: GitOptions): Promise<GitResult>
   /** Runs and returns stdout, throwing a readable Error when git fails. */
   out(args: string[], options?: GitOptions): Promise<string>
+  /** Whether each absolute path exists where the repository lives (this computer or a remote host). */
+  exists(paths: string[]): Promise<boolean[]>
+  /** Where git runs: on this computer, or on a remote host through a terminal (read-only there). */
+  readonly remote?: boolean
 }
 
 export class GitError extends Error {
@@ -59,6 +64,7 @@ export function createGit(root: string, gitPath = 'git'): Git {
       const result = await run(args, options)
       if (!result.ok) throw new GitError(lastLines(result.stderr || result.stdout) || `git ${args[0]} failed`, result)
       return result.stdout
-    }
+    },
+    exists: async (paths) => paths.map((path) => existsSync(path))
   }
 }

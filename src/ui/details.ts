@@ -1,7 +1,7 @@
 import type { CommitDetails, CommitRow, FileChange } from '../shared/protocol.ts'
 import { h, icon } from './dom.ts'
 import { buildFileTree, type DirNode } from './filetree.ts'
-import { fullDate, shortHash, STATUS_NAMES } from './format.ts'
+import { shortHash, STATUS_NAMES } from './format.ts'
 
 const INDENT = 16
 /** Folders the user folded, by path; kept while moving between commits. */
@@ -166,41 +166,36 @@ export function renderMany(
   )
 }
 
-export function renderDetails(container: HTMLElement, d: CommitDetails, host: DetailsHost): void {
-  const [subject, ...rest] = d.message.split('\n')
-  const body = rest.join('\n').replace(/^\s*\n/, '')
-  const parents = d.parents.map((p, i) =>
-    h('span', null, i ? ', ' : '', h('a', { class: 'hash-link mono', title: p, onclick: () => host.select(p) }, shortHash(p)))
-  )
-  container.replaceChildren(
-    filesSection(d.files, d.parents.length > 1 ? '(vs. first parent)' : null, (index) => host.openDiff(index)),
+/** The right pane for one commit: only the files it changed. */
+export function renderDetails(container: HTMLElement, d: CommitDetails, host: Pick<DetailsHost, 'openDiff'>): void {
+  container.replaceChildren(filesSection(d.files, d.parents.length > 1 ? '(vs. first parent)' : null, (index) => host.openDiff(index)))
+}
 
+/** A person with their email, as `Name <email>`. */
+const person = (name: string, email: string) => [name, ' <', h('span', { class: 'email' }, email), '>']
+
+/**
+ * The commit's facts and full message, shown inside the log under its row: Commit, Parents, Author,
+ * Committer and Date, then the message. A parent's hash selects that commit.
+ */
+export function commitSummary(d: CommitDetails, select: (hash: string) => void): HTMLElement {
+  const field = (label: string, ...value: (Node | string)[]) => h('div', { class: 'summary-field' }, h('strong', null, `${label}: `), ...value)
+  const parents = d.parents.flatMap((p, i) => [
+    i ? ', ' : '',
+    h('a', { class: 'hash-link mono', title: 'Select this commit', onclick: () => select(p) }, p)
+  ])
+  return h(
+    'div',
+    { class: 'commit-summary' },
     h(
       'div',
-      { class: 'section' },
-      h('div', { class: 'subject' }, subject),
-      body ? h('div', { class: 'body' }, body) : null,
-      h(
-        'div',
-        { class: 'meta' },
-        h('div', null, h('span', { class: 'mono' }, shortHash(d.hash)), ' ', h('span', { class: 'muted' }, 'by'), ' ', h('strong', null, d.author), ' ', h('span', { class: 'muted' }, `<${d.email}>`)),
-        h('div', { class: 'muted' }, `on ${fullDate(d.authorTime)}`),
-        d.committer !== d.author || d.commitTime !== d.authorTime
-          ? h('div', { class: 'muted' }, `committed by ${d.committer} on ${fullDate(d.commitTime)}`)
-          : null,
-        parents.length ? h('div', null, h('span', { class: 'muted' }, parents.length > 1 ? 'Parents: ' : 'Parent: '), ...parents) : null,
-        h('div', { class: 'mono muted', style: 'user-select:text' }, d.hash)
-      ),
-      h(
-        'div',
-        { class: 'branches-line' },
-        d.branches.length
-          ? [h('span', { class: 'muted' }, `In ${d.branches.length}${d.branches.length >= 50 ? '+' : ''} branch${d.branches.length === 1 ? '' : 'es'}: `), d.branches.join(', ')].reduce<HTMLElement>(
-              (el, part) => (el.append(part), el),
-              h('span', null)
-            )
-          : h('span', { class: 'muted' }, 'Not in any branch')
-      )
-    )
+      { class: 'fields' },
+      field('Commit', h('span', { class: 'mono' }, d.hash)),
+      field('Parents', ...(parents.length ? parents : [h('span', { class: 'muted' }, 'none (root commit)')])),
+      field('Author', ...person(d.author, d.email)),
+      field('Committer', ...person(d.committer, d.committerEmail)),
+      field('Date', new Date(d.authorTime * 1000).toString())
+    ),
+    h('div', { class: 'message' }, d.message)
   )
 }

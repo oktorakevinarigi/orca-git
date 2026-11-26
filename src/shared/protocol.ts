@@ -7,9 +7,11 @@ export interface RepoInfo {
   head: { branch: string | null; hash: string | null }
   /** A sequencer operation left in progress (by a terminal, say); rewrites are refused while set. */
   operation: 'rebase' | 'merge' | 'cherry-pick' | 'revert' | null
+  /** The repository is on a remote host (SSH or a paired Orca server): git runs there through a terminal, read-only. */
+  remote?: boolean
 }
 
-/** A local workspace the focused context could be, when several share its name and branch. */
+/** A workspace the focused context could be, when several share its name and branch. */
 export interface WorkspaceChoice {
   id: string
   name: string

@@ -35,8 +35,8 @@ export const orca = (globalThis as unknown as { orca: FrameOrca }).orca
 const LONG = { timeoutMs: 120_000 }
 
 export const api = {
-  resolve: (root?: string, workspaceId?: string): Promise<RepoResult> =>
-    orca.plugin.request('repo.resolve', root ? { root } : workspaceId ? { workspaceId } : {}),
+  resolve: (root?: string, workspaceId?: string | null): Promise<RepoResult> =>
+    orca.plugin.request('repo.resolve', { ...(root ? { root } : {}), ...(workspaceId ? { workspaceId } : {}) }, LONG),
   refs: (root: string): Promise<RefsResult> => orca.plugin.request('repo.refs', { root }),
   watch: (root: string): Promise<{ ok: boolean }> => orca.plugin.request('repo.watch', { root }),
   page: (root: string, filter: LogFilter, skip: number, limit?: number): Promise<LogPage> =>
@@ -63,8 +63,8 @@ export const api = {
     orca.plugin.request('action.check', { root, kind, hashes }, LONG),
   run: (root: string, action: ActionRequest): Promise<ActionResult> => orca.plugin.request('action.run', { root, action }, LONG),
   openTab: (workspaceId?: string | null): Promise<{ ok: boolean; reason?: string }> =>
-    orca.plugin.request('tab.open', workspaceId ? { workspaceId } : {}),
-  openDiffTab: (request: DiffTabRequest): Promise<{ ok: boolean; reason?: string }> => orca.plugin.request('diff.openTab', request)
+    orca.plugin.request('tab.open', workspaceId ? { workspaceId } : {}, LONG),
+  openDiffTab: (request: DiffTabRequest): Promise<{ ok: boolean; reason?: string }> => orca.plugin.request('diff.openTab', request, LONG)
 }
 
 export function errorMessage(error: unknown): string {

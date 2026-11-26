@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.9.0 — 2026-11-26
+
+Git Log opens in an Orca tab more easily, the way Git Control does: a **Git Log** button in the
+status bar opens it, **Git Log** is in the tab bar + menu (an untitled tab shows the focused
+repository), and the command is now **Git Log: Open in a Tab**. The tab's file is now named
+`Git Log.gitlog`, so the tab reads "Git Log" instead of ".orca-git-log.gitlog" (the old file is
+removed when the tab opens), and every `*.gitlog` file is kept out of `git status`, on this computer
+and on a remote host alike.
+
+## 0.8.0 — 2026-11-26
+
+Git Log now opens the workspace that is actually focused, by its id, instead of guessing by name: a
+project on a paired Orca server that also has a local copy with the same name and branch was read
+from the local copy, so its diff tabs opened in a workspace the window was not showing. Orca's
+plugin API does not reach a paired server's workspaces, so Git Log now reaches them with Orca's own
+command line (`orca --environment`), which it finds by itself, and opens its helper terminal there.
+Clicking a changed file opens its diff tab in the window, the "Open Git Log in an editor tab" button
+works for remote projects too (both write their small file beside the project on that host), and a
+tab the window cannot open for a plugin is opened with the command line instead. When a diff tab of
+a remote project cannot open, the panel says why. A helper terminal that can no longer be typed into
+is closed before a new one opens, and failures to open tabs are written to the plugin's log.
+
+## 0.7.1 — 2026-11-25
+
+Clicking a changed file of a project on a remote host now opens its diff in an editor tab, as it does
+for a local project: Git Log writes the tab's small file in the project's `.orca-git-log` folder on
+that host through its helper terminal (keeping that folder out of `git status`), and Orca opens it
+from there. The Commit, Parents, Author, Committer and Date lines under an opened commit are no
+longer drawn as boxes, and the opened area has its left and bottom border lines back.
+
+## 0.7.0 — 2026-11-25
+
+Projects on a remote host (a paired Orca server or an SSH host) now open in Git Log instead of being
+refused. Orca gives plugins no direct access to a remote host, so Git Log opens one terminal there,
+titled "Git Log (remote git)", types its git commands into it and reads the answers back: the commit
+graph, branches, commit details, uncommitted changes and file diffs all load, and a changed file opens
+in the editor from its row. On a remote host the log is read-only for now: actions that change the
+repository (checkout, reset, squash, rebase, fetch, push and the others) are turned off with the
+reason, diffs open inside the panel rather than in their own tab, and the panel refreshes when it gets
+focus or on Refresh instead of watching files. The plugin now asks for permission to open, type into
+and read its terminals. The details opened under a commit no longer have a border or underlined links.
+
+## 0.6.0 — 2026-11-25
+
+Selecting a single commit now opens its details right under its row in the log, like an accordion:
+Commit, Parents (click one to jump to it), Author and Committer with their emails, the Date, and then
+the whole commit message. The graph lanes carry on through the opened area, and selecting another
+commit closes it and opens the new one; click the selected commit again to fold or unfold it. The
+details pane on the right now shows only the files the commit changed. Text in the opened details can
+be selected and copied with Ctrl+C.
+
 ## 0.5.0 — 2026-11-25
 
 The "Uncommitted Changes" row can now be selected, by a click or with the arrow keys and Home. The

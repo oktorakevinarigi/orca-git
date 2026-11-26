@@ -1,8 +1,10 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import { installFakeOrcaCli } from './fake-orca-cli.test-util.ts'
+import { fakeTerminals } from './fake-terminal.test-util.ts'
 import * as main from './main.ts'
 import { matchWorkspace, mentions } from './repo.ts'
 
@@ -59,14 +61,36 @@ test('resolves the focused workspace, pages the log and opens the editor tab', a
     assert.equal(run.previousHead, newest.hash)
     assert.deepEqual(worker.posts.at(-1), { event: 'repo.changed', payload: { root } })
 
+    // The tab's file reads as "Git Log"; an earlier version's file goes, every *.gitlog stays out of git status.
+    writeFileSync(join(root, '.orca-git-log.gitlog'), '{}')
     assert.deepEqual(await worker.request('tab.open', {}), { ok: true })
+    assert.equal(main.ANCHOR, 'Git Log.gitlog')
     assert.deepEqual(h.callsOf('editor.open'), [{ workspaceId: 'wt-1', path: main.ANCHOR }])
     assert.equal(JSON.parse(readFileSync(join(root, main.ANCHOR), 'utf8')).root, root)
-    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\.orca-git-log\.gitlog$/m)
+    assert.equal(existsSync(join(root, '.orca-git-log.gitlog')), false)
+    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\*\.gitlog$/m)
     assert.equal(sh(root, 'status', '--porcelain'), '')
 
     await assert.rejects(worker.request('log.page', { root: tmpdir(), filter: {}, skip: 0 }))
     assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+  } finally {
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+test('an untitled Git Log tab from the + menu shows the focused repository and keeps its file out of git status', async () => {
+  const root = fixture()
+  try {
+    const worker = await mountWorker(main, { host: host(root) })
+    // The + menu creates an empty "untitled.gitlog"; the tab finds the repository from the focus.
+    writeFileSync(join(root, 'untitled.gitlog'), '')
+    const panel = await worker.request('repo.resolve', {})
+    assert.equal(panel.ok, true)
+    assert.equal(sh(root, 'status', '--porcelain'), '?? untitled.gitlog', 'the side panel changes nothing')
+    const tab = await worker.request('repo.resolve', {}, { panel: 'log-tab' })
+    assert.equal(tab.ok && tab.repo.root, root)
+    assert.equal(sh(root, 'status', '--porcelain'), '')
     await worker.deactivate()
   } finally {
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
@@ -103,22 +127,120 @@ test('lists the uncommitted files, diffs them and opens a work-tree file in the 
   }
 })
 
-test('a workspace that only exists on a remote host is reported as unsupported', async () => {
-  const worker = await mountWorker(main, {
-    host: mockHost({
+test('a workspace on a remote host is read through a helper terminal, read-only', async () => {
+  const root = fixture()
+  try {
+    writeFileSync(join(root, 'one.txt'), 'uno')
+    const terminals = fakeTerminals()
+    const h = mockHost({
       results: {
+        ...terminals.results,
         'workspace.readContext': { branch: 'main', displayName: 'demo', terminals: [] },
         'workspace.list': {
-          workspaces: [{ id: 'r', kind: 'worktree', name: 'demo', path: '/home/me/demo', branch: 'main', hostId: 'ssh-1' }],
+          workspaces: [{ id: 'r', kind: 'worktree', name: 'demo', path: root, branch: 'main', hostId: 'runtime:server-1' }],
           truncated: false
+        },
+        'editor.open': { opened: true }
+      }
+    })
+    const worker = await mountWorker(main, { host: h })
+    const resolved = await worker.request('repo.resolve', {})
+    assert.equal(resolved.ok, true, resolved.ok ? '' : resolved.reason)
+    assert.equal(resolved.ok && resolved.repo.remote, true)
+    assert.equal(resolved.ok && resolved.repo.workspaceId, 'r')
+    assert.equal(resolved.ok && resolved.repo.head.branch, 'main')
+
+    const page = await worker.request('log.page', { root, filter: {}, skip: 0, limit: 10 })
+    assert.deepEqual(page.commits.map((c: { subject: string }) => c.subject), ['three', 'two', 'one'])
+    assert.deepEqual((await worker.request('repo.uncommittedFiles', { root })).files, [{ status: 'M', path: 'one.txt' }])
+    const diff = await worker.request('file.diff', { root, hash: '0'.repeat(40), path: 'one.txt' })
+    assert.deepEqual(diff.hunks[0].lines.map((l: { kind: string; text: string }) => `${l.kind}${l.text}`), ['-one', '+uno'])
+
+    // Opening a file goes through Orca, which reaches the remote host itself.
+    assert.deepEqual(await worker.request('file.open', { root, path: 'one.txt' }), { ok: true })
+    assert.deepEqual(h.callsOf('editor.open'), [{ workspaceId: 'r', path: 'one.txt' }])
+    // A changed file opens in a diff tab, as it does locally: its small file is written on the host.
+    const files = [{ status: 'A', path: 'three.txt' }]
+    assert.deepEqual(await worker.request('diff.openTab', { root, hash: page.commits[0].hash, files, index: 0, workspaceId: 'r' }), { ok: true })
+    const anchor = `.orca-git-log/three.txt @${page.commits[0].hash.slice(0, 8)}.gitdiff`
+    assert.deepEqual(h.callsOf('editor.open').at(-1), { workspaceId: 'r', path: anchor })
+    assert.deepEqual(JSON.parse(readFileSync(join(root, anchor), 'utf8')), { root, hash: page.commits[0].hash, files, index: 0 })
+    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\.orca-git-log\/$/m)
+    assert.equal(sh(root, 'status', '--porcelain'), 'M one.txt')
+    // Nothing that changes the repository runs there.
+    assert.deepEqual(await worker.request('repo.watch', { root }), { ok: false })
+    assert.deepEqual(await worker.request('action.run', { root, action: { kind: 'fetch' } }), { ok: false, message: main.REMOTE_READ_ONLY })
+    // The Git Log tab opens there too, from a small file written beside the project.
+    assert.deepEqual(await worker.request('tab.open', {}), { ok: true })
+    assert.deepEqual(h.callsOf('editor.open').at(-1), { workspaceId: 'r', path: main.ANCHOR })
+    assert.deepEqual(JSON.parse(readFileSync(join(root, main.ANCHOR), 'utf8')), { root, workspaceId: 'r' })
+    assert.equal(sh(root, 'status', '--porcelain'), 'M one.txt')
+    assert.equal(terminals.open.size, 1)
+    assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+    assert.equal(terminals.open.size, 0, 'the helper terminal closes with the plugin')
+  } finally {
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+test('a paired Orca server workspace is found by its id, never as a same-named local copy, and reached with the orca command line', async () => {
+  const server = fixture()
+  const local = fixture()
+  try {
+    writeFileSync(join(server, 'two.txt'), 'dos')
+    const cli = installFakeOrcaCli('env-1', [
+      { id: `repo-1::${server}`, displayName: 'demo', path: server, branch: 'refs/heads/main', identity: { key: 'wt2:local:inst-1', instanceId: 'inst-1' } }
+    ])
+    // The window names the server workspace by a desktop identity that this computer's list lacks.
+    const focused = 'identity:wt2:runtime:env-1:inst-1'
+    let windowOpens = true
+    const h = mockHost({
+      results: {
+        'workspace.readContext': { workspaceId: focused, branch: 'main', displayName: 'demo', terminals: [] },
+        'workspace.list': {
+          workspaces: [{ id: 'identity:wt2:local:copy', kind: 'worktree', name: 'demo', path: local, branch: 'main', hostId: 'local' }],
+          truncated: false
+        },
+        'editor.open': () => {
+          if (!windowOpens) throw Object.assign(new Error('This window does not list that workspace.'), { code: 'unavailable' })
+          return { opened: true }
         }
       }
     })
-  })
-  const resolved = await worker.request('repo.resolve', {})
-  assert.equal(resolved.ok, false)
-  assert.match(resolved.ok ? '' : resolved.reason, /Remote workspaces/)
-  await worker.deactivate()
+    const worker = await mountWorker(main, { host: h })
+    const resolved = await worker.request('repo.resolve', {})
+    assert.equal(resolved.ok, true, resolved.ok ? '' : resolved.reason)
+    assert.equal(resolved.ok && resolved.repo.root, server)
+    assert.equal(resolved.ok && resolved.repo.remote, true)
+    assert.equal(resolved.ok && resolved.repo.workspaceId, focused)
+    const page = await worker.request('log.page', { root: server, filter: {}, skip: 0, limit: 10 })
+    assert.deepEqual(page.commits.map((c: { subject: string }) => c.subject), ['three', 'two', 'one'])
+    assert.deepEqual((await worker.request('repo.uncommittedFiles', { root: server })).files, [{ status: 'M', path: 'two.txt' }])
+    assert.ok(cli.calls().some((args) => args.join(' ').startsWith('terminal create --environment env-1 --worktree identity:wt2:local:inst-1')))
+
+    // Diff tab, Git Log tab and a file open in the window, on the server workspace.
+    const files = [{ status: 'M', path: 'two.txt' }]
+    assert.deepEqual(await worker.request('diff.openTab', { root: server, hash: '0'.repeat(40), files, index: 0, workspaceId: focused }), { ok: true })
+    assert.deepEqual(h.callsOf('editor.open').at(-1), { workspaceId: focused, path: '.orca-git-log/two.txt (uncommitted).gitdiff' })
+    assert.ok(readFileSync(join(server, '.orca-git-log', 'two.txt (uncommitted).gitdiff'), 'utf8').includes('"two.txt"'))
+    assert.deepEqual(await worker.request('tab.open', { workspaceId: focused }), { ok: true })
+    assert.deepEqual(JSON.parse(readFileSync(join(server, main.ANCHOR), 'utf8')), { root: server, workspaceId: focused })
+    assert.equal(sh(server, 'status', '--porcelain'), 'M two.txt')
+    // When the window cannot open it for a plugin, the command line opens it.
+    windowOpens = false
+    assert.deepEqual(await worker.request('file.open', { root: server, path: 'two.txt', workspaceId: focused }), { ok: true })
+    assert.deepEqual(cli.opened(), [{ worktree: 'identity:wt2:local:inst-1', path: 'two.txt' }])
+
+    // The same-named local copy was never touched.
+    assert.equal(sh(local, 'status', '--porcelain'), '')
+    assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+    assert.ok(cli.calls().some((args) => args[0] === 'terminal' && args[1] === 'close'))
+  } finally {
+    rmSync(server, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    rmSync(local, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
 })
 
 test('same-named workspaces are told apart by terminal titles, then by a previous choice', () => {

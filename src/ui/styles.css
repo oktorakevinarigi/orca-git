@@ -611,6 +611,63 @@ body.col-resizing * {
   font-weight: 600;
 }
 
+/* The selected commit's facts and message, opened inside the log under its row. */
+.commit-expanded {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--fg) 4%, var(--bg));
+  border-bottom: 1px solid var(--border);
+}
+
+.expanded-graph {
+  flex: none;
+  padding-left: 2px;
+}
+
+.expanded-content {
+  flex: 1;
+  min-width: 0;
+  align-self: flex-start;
+  max-height: min(60vh, 480px);
+  overflow: auto;
+  border-left: 1px solid var(--border);
+}
+
+.commit-summary {
+  padding: 14px 18px 16px;
+  user-select: text;
+  cursor: auto;
+}
+
+.commit-summary .fields {
+  display: grid;
+  gap: 3px;
+  word-break: break-all;
+}
+
+.commit-summary .summary-field strong {
+  font-weight: 600;
+}
+
+.commit-summary .hash-link,
+.commit-summary .email {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.commit-summary .hash-link {
+  cursor: pointer;
+}
+
+.commit-summary .message {
+  margin-top: 18px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .row.uncommitted .cell.subject .text {
   font-style: italic;
 }

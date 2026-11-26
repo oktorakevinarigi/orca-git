@@ -33,10 +33,15 @@ a details pane with file diffs, and a right-click menu to rewrite history on a m
   runs `git fetch --all --prune`; **Push** lists the commits to send, lets you pick the remote and the
   remote branch (publishing a new branch sets its upstream), and warns before a force push
   (`--force-with-lease`) when the remote has commits you do not have.
+- **Remote projects**: a project on a paired Orca server or an SSH host opens too, read-only: Git Log
+  runs git there through one terminal titled "Git Log (remote git)" and reads the answers back. Diff
+  tabs and the Git Log tab open there as well. A paired server is reached with Orca's command line
+  (`orca`), which Git Log looks for on PATH and inside the Orca app.
 - **Safe checkout**: with uncommitted changes, choose to stash them first or carry them over.
-- **Details pane**: message, author, committer, refs and parents of the selected commit, and its changed
-  files as a folder tree (single-child folders joined, file counts, fold/unfold, expand/collapse all),
-  colored like Git: modified in yellow, added in green, deleted in red.
+- **Commit details**: selecting a commit opens it under its row in the log (Commit, Parents, Author,
+  Committer, Date and the full message); click it again to fold it.
+- **Details pane**: the changed files of the selected commit as a folder tree (single-child folders
+  joined, file counts, fold/unfold, expand/collapse all), colored like Git: modified in yellow, added in green, deleted in red.
 - **Diff viewer**: click a changed file (or press Enter on it) to open what the commit changed
   in its own editor tab, side by side (line numbers in the middle) or unified, with syntax colors for
   common languages and changed words highlighted. A slim toolbar moves
@@ -66,11 +71,12 @@ a details pane with file diffs, and a right-click menu to rewrite history on a m
 - **Right sidebar panel** "Git Log": a compact layout that drops columns as the panel narrows.
   Drag the borders between the column headers to resize Subject, Author, Date and Hash; double-click a
   border to reset them.
-- **Editor tab**: run **Git Log: Open in Editor Tab** from the command palette (or click the ↗ button
-  in the panel) for the full-width layout with the branch tree. It opens a small anchor file,
-  `.orca-git-log.gitlog`, at the workspace root; the plugin adds it to `.git/info/exclude` so it never
-  shows up as untracked. Diff tabs open similar files from a .orca-git-log/ folder (the newest 40
-  are kept), excluded the same way.
+- **Git Log in a tab**: press **Git Log** in the status bar, run **Git Log: Open in a Tab** from the
+  command palette, click the ↗ button in the panel, or pick **Git Log** in the tab bar + menu, for the
+  full-width layout with the branch tree. The tab opens a small file named `Git Log.gitlog` at the
+  workspace root (Orca names the tab after it); the plugin adds `*.gitlog` to `.git/info/exclude` so
+  these files never show up as untracked. Diff tabs open similar files from a .orca-git-log/ folder
+  (the newest 40 are kept), excluded the same way.
 
 ## Install
 
@@ -103,7 +109,8 @@ a conflict it is aborted, and the branch is left exactly as it was.
 
 ## Limitations
 
-- Local workspaces only: SSH and paired-host workspaces are not supported yet. WSL folders opened from
+- SSH and paired-host workspaces are read-only and slower than local ones: every git call goes through
+  a terminal on that host, which needs `sh`, `git`, `gzip` and `base64` there. WSL folders opened from
   Windows (`\\wsl.localhost\...`) work through Git for Windows, which is slower there than inside WSL.
 - The diff viewer is read-only, and very large diffs are cut after 20,000 lines.
 - Conflicts during a rewrite, cherry-pick or revert are not resolved in the panel; the operation is

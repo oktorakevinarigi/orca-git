@@ -125,6 +125,20 @@ export interface GraphSvgOptions {
   lanes?: number
 }
 
+/**
+ * The lanes leaving `row` drawn straight down over `height` pixels: the graph under a commit
+ * while its details are expanded below it.
+ */
+export function graphGapSvg(row: GraphRow, height: number, options: GraphSvgOptions = {}): string {
+  const width = (options.lanes ?? row.width) * LANE_WIDTH
+  const lanes = new Map<number, Segment>()
+  for (const s of [...row.through, ...row.outgoing]) if (!lanes.has(s.lane)) lanes.set(s.lane, s)
+  const parts = [...lanes.values()].map(
+    (s) => `<path d="${edge(x(s.lane), 0, x(s.lane), height)}" class="edge${s.dashed ? ' dashed' : ''} c${s.color}"/>`
+  )
+  return `<svg class="graph" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${parts.join('')}</svg>`
+}
+
 /** One row of the graph as SVG markup. */
 export function graphSvg(row: GraphRow, options: GraphSvgOptions = {}): string {
   const h = ROW_HEIGHT

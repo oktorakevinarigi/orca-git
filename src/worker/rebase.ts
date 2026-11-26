@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PlanItem, RangeCommit, RewriteKind } from '../shared/protocol.ts'
@@ -160,8 +160,11 @@ export async function operationInProgress(git: Git): Promise<'rebase' | 'merge' 
     ['CHERRY_PICK_HEAD', 'cherry-pick'],
     ['REVERT_HEAD', 'revert']
   ]
-  for (const [name, kind] of checks) if (existsSync(await gitPath(git, name))) return kind
-  return null
+  // One call for every path, then one existence check: each call is a round trip on a remote host.
+  const paths = (await git.out(['rev-parse', '--path-format=absolute', ...checks.flatMap(([name]) => ['--git-path', name])])).split(/\r?\n/)
+  const found = await git.exists(checks.map((_, i) => paths[i]?.trim() ?? ''))
+  const index = found.indexOf(true)
+  return index >= 0 ? checks[index][1] : null
 }
 
 /** Remote branches that already contain `hash`: rewriting it then needs a force push. */

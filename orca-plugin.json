@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "git-log",
   "name": "Git Log",
-  "version": "0.5.0",
+  "version": "0.9.0",
   "description": "Git log: commit graph, branches, filters, details and file diffs, with multi-select squash, fixup, drop, reword, interactive rebase, cherry-pick, revert and reset from a right-click menu.",
   "license": "MIT",
   "repository": "https://github.com/emamalet/Orca-git-log-panel",
@@ -45,7 +45,13 @@
       }
     ],
     "commands": [
-      { "id": "open-tab", "title": "Git Log: Open in Editor Tab", "when": "workspace" }
+      { "id": "open-tab", "title": "Git Log: Open in a Tab", "when": "workspace" }
+    ],
+    "statusBarItems": [
+      { "id": "open-tab", "text": "Git Log", "icon": "branch", "tooltip": "Open Git Log in a tab", "command": "open-tab" }
+    ],
+    "newFiles": [
+      { "id": "log", "title": "Git Log", "extension": ".gitlog" }
     ],
     "settings": [
       {
@@ -70,6 +76,8 @@
   "capabilities": [
     { "kind": "workspace:read" },
     { "kind": "workspace:write" },
+    { "kind": "terminal:send" },
+    { "kind": "terminal:read" },
     { "kind": "settings:own" }
   ]
 }

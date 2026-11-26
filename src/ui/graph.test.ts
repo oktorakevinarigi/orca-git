@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { computeGraph, graphLanes, graphSvg, LANE_WIDTH } from './graph.ts'
+import { computeGraph, graphGapSvg, graphLanes, graphSvg, LANE_WIDTH } from './graph.ts'
 import { reachableFrom, refLabels, relativeDate } from './format.ts'
 import { changeBlocks, changedRange, splitRows } from './diffmodel.ts'
 import { markSpan } from './ruler.ts'
@@ -33,6 +33,18 @@ test('two branch tips get their own lanes, and freed lanes are reused', () => {
   const graph = computeGraph([row('x', 'a'), row('y', 'a'), row('a', 'r'), row('z', 'r'), row('r')])
   assert.deepEqual(graph.map((g) => g.lane), [0, 1, 0, 1, 0])
   assert.ok(graphSvg(graph[0]).includes('class="node c0"'), 'every commit point is a solid dot')
+})
+
+test('the gap under an expanded commit continues every lane leaving it, once each', () => {
+  // m merges f into b: below m, lanes 0 (b) and 1 (f) go on down.
+  const graph = computeGraph([row('m', 'b', 'f'), row('f', 'a'), row('b', 'a'), row('a')])
+  const below = graphGapSvg(graph[0], 120, { lanes: 2 })
+  assert.equal((below.match(/<path /g) ?? []).length, 2)
+  assert.ok(below.includes(`M${LANE_WIDTH / 2} 0L${LANE_WIDTH / 2} 120`))
+  assert.ok(below.includes(`height="120"`))
+  // f's row: lane 0 passes through and lane 1 heads to a; nothing leaves the last commit.
+  assert.equal((graphGapSvg(graph[1], 50).match(/<path /g) ?? []).length, 2)
+  assert.equal((graphGapSvg(graph[3], 50).match(/<path /g) ?? []).length, 0)
 })
 
 test('uncommitted changes draw a dashed node and a dashed line down to HEAD, across other lanes', () => {
